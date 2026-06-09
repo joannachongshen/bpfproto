@@ -1,3 +1,7 @@
+[hidden] {
+  display: none !important;
+}
+
 .appShell {
   --usgs-green: #00843d;
   --usgs-green-dark: #005ea8;
@@ -86,10 +90,10 @@
 .eyebrow {
   color: var(--usgs-green);
   font-size: 12px;
-  font-weight: 700;
+  /* font-weight: 700; */
   letter-spacing: 0;
   margin: 0;
-  text-transform: uppercase;
+  /* text-transform: uppercase; */
 }
 
 .actionPanel {
@@ -322,6 +326,13 @@
   --status-color: var(--returned);
   --status-bg: var(--returned-bg);
   --status-text: #7f0000;
+}
+
+.step[data-status='upcoming'],
+.legendItem[data-status='upcoming'] {
+  --status-color: #8a8886;
+  --status-bg: #ffffff;
+  --status-text: #3d3d3d;
 }
 
 .emptyState {

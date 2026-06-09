@@ -1,11 +1,14 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
-type StageStatus = 'completed' | 'inProgress' | 'skipped' | 'returned'
+type StageStatus = 'completed' | 'inProgress' | 'upcoming'
+
+type LoadState = 'loading' | 'ready' | 'error'
 
 type WorkflowStage = {
   id: string
   stage: string
+  stageName: string
   sequenceNumber: number
   description: string
   workflowName: string
@@ -13,198 +16,296 @@ type WorkflowStage = {
 }
 
 type DataverseWorkflowStageRow = {
+  usgs_workflowstageid?: string
   usgs_stage: string
+  usgs_name: string
   usgs_sequencenumber: number
   usgs_description?: string
-  'W.usgs_name'?: string
-  'W.usgs_description'?: string
-  'W.usgs_stagescount'?: number
-  'W.usgs_workflowid'?: string
+  // Parent workflow, returned nested via $expand=usgs_Workflow.
+  usgs_Workflow?: {
+    usgs_workflowid?: string
+    usgs_name?: string
+    usgs_description?: string
+    usgs_stagescount?: number
+  }
 }
 
-type WorkflowAction = {
-  id: string
-  label: string
-  targetSequence: number
-  helpText: string
+type FormContext = {
+  entityName: string
+  recordId: string
 }
 
 type StageViewModel = WorkflowStage & {
   status: StageStatus
   isCurrent: boolean
-  isDestination: boolean
+  completedOn?: string
 }
 
-const currentSequence = 3
+type DataverseWorkflowTaskRow = {
+  usgs_completeddate?: string | null
+  statuscode?: number
+  _usgs_workflowstagefrom_value?: string | null
+  _usgs_workflowstageto_value?: string | null
+}
 
-const fetchXml = `<fetch xmlns:generator='MarkMpn.SQL4CDS'>
-  <entity name='usgs_workflowstage'>
-    <attribute name='usgs_stage' />
-    <attribute name='usgs_sequencenumber' />
-    <attribute name='usgs_description' />
-    <link-entity name='usgs_workflow' to='usgs_workflow' from='usgs_workflowid' alias='W' link-type='inner'>
-      <attribute name='usgs_name' />
-      <attribute name='usgs_description' />
-      <attribute name='usgs_stagescount' />
-      <attribute name='usgs_workflowid' />
-      <filter>
-        <condition attribute='usgs_workflowid' operator='eq' value='da4215da-44fd-f011-8407-001dd80bcb40' />
-      </filter>
-    </link-entity>
-    <order attribute='usgs_sequencenumber' />
-  </entity>
-</fetch>`
+type XrmWebApi = {
+  retrieveMultipleRecords: <T = Record<string, unknown>>(
+    entityLogicalName: string,
+    options?: string,
+  ) => Promise<{ entities: T[] }>
+  retrieveRecord: (
+    entityLogicalName: string,
+    id: string,
+    options?: string,
+  ) => Promise<Record<string, unknown>>
+}
 
-const workflowStageRows: DataverseWorkflowStageRow[] = [
-  {
-    usgs_stage: 'Intake Review',
-    usgs_sequencenumber: 1,
-    usgs_description: 'Confirm the request, form logic, and required product details.',
-    'W.usgs_name': 'Product Review Workflow',
-    'W.usgs_description': 'Routes a product through review, approval, and publication.',
-    'W.usgs_stagescount': 6,
-    'W.usgs_workflowid': 'da4215da-44fd-f011-8407-001dd80bcb40',
-  },
-  {
-    usgs_stage: 'Program Validation',
-    usgs_sequencenumber: 2,
-    usgs_description: 'Validate program ownership, data source, and business rules.',
-    'W.usgs_name': 'Product Review Workflow',
-    'W.usgs_description': 'Routes a product through review, approval, and publication.',
-    'W.usgs_stagescount': 6,
-    'W.usgs_workflowid': 'da4215da-44fd-f011-8407-001dd80bcb40',
-  },
-  {
-    usgs_stage: 'Quality Check',
-    usgs_sequencenumber: 3,
-    usgs_description: 'Current stage for metadata, evidence, and completeness checks.',
-    'W.usgs_name': 'Product Review Workflow',
-    'W.usgs_description': 'Routes a product through review, approval, and publication.',
-    'W.usgs_stagescount': 6,
-    'W.usgs_workflowid': 'da4215da-44fd-f011-8407-001dd80bcb40',
-  },
-  {
-    usgs_stage: 'Technical Review',
-    usgs_sequencenumber: 4,
-    usgs_description: 'Subject matter experts evaluate technical readiness.',
-    'W.usgs_name': 'Product Review Workflow',
-    'W.usgs_description': 'Routes a product through review, approval, and publication.',
-    'W.usgs_stagescount': 6,
-    'W.usgs_workflowid': 'da4215da-44fd-f011-8407-001dd80bcb40',
-  },
-  {
-    usgs_stage: 'Publishing Approval',
-    usgs_sequencenumber: 5,
-    usgs_description: 'Approvers decide whether the product is ready for release.',
-    'W.usgs_name': 'Product Review Workflow',
-    'W.usgs_description': 'Routes a product through review, approval, and publication.',
-    'W.usgs_stagescount': 6,
-    'W.usgs_workflowid': 'da4215da-44fd-f011-8407-001dd80bcb40',
-  },
-  {
-    usgs_stage: 'Released',
-    usgs_sequencenumber: 6,
-    usgs_description: 'Final stage after approval and publication tasks are complete.',
-    'W.usgs_name': 'Product Review Workflow',
-    'W.usgs_description': 'Routes a product through review, approval, and publication.',
-    'W.usgs_stagescount': 6,
-    'W.usgs_workflowid': 'da4215da-44fd-f011-8407-001dd80bcb40',
-  },
-]
+type XrmContext = {
+  WebApi: XrmWebApi
+}
 
-const workflowActions: WorkflowAction[] = [
-  {
-    id: 'submit-technical-review',
-    label: 'Submit to Technical Review',
-    targetSequence: 4,
-    helpText: 'Moves the product forward to the next reviewer.',
-  },
-  {
-    id: 'send-publishing-approval',
-    label: 'Send to Publishing Approval',
-    targetSequence: 5,
-    helpText: 'Moves forward and skips Technical Review for this form path.',
-  },
-  {
-    id: 'return-program-validation',
-    label: 'Return to Program Validation',
-    targetSequence: 2,
-    helpText: 'Routes backward because required validation is incomplete.',
-  },
-  {
-    id: 'return-intake-review',
-    label: 'Return to Intake Review',
-    targetSequence: 1,
-    helpText: 'Routes backward to the original intake team.',
-  },
-]
+declare global {
+  interface Window {
+    Xrm?: XrmContext
+  }
+}
+
+function buildStagesQuery(workflowId: string): string {
+  return [
+    '?$select=_usgs_stage_value,usgs_sequencenumber,usgs_description,usgs_name',
+    '&$expand=usgs_Workflow($select=usgs_name,usgs_description,usgs_stagescount)',
+    `&$filter=_usgs_workflow_value eq ${workflowId}`,
+    '&$orderby=usgs_sequencenumber',
+  ].join('')
+}
 
 const statusContent: Record<StageStatus, { label: string; icon: string }> = {
   completed: { label: 'Completed', icon: 'check' },
   inProgress: { label: 'In progress', icon: 'progress' },
-  skipped: { label: 'Skipped', icon: 'skip' },
-  returned: { label: 'Returned', icon: 'return' },
+  upcoming: { label: 'Upcoming', icon: 'upcoming' },
+}
+
+function getXrmContext(): XrmContext | undefined {
+  if (window.Xrm?.WebApi) {
+    return window.Xrm
+
+  }
+
+  try {
+    return window.parent?.Xrm?.WebApi ? window.parent.Xrm : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function getFormContext(): FormContext | undefined {
+  // navigateTo / pane.navigate delivers our custom fields as a single
+  // URL-encoded `data` query string parameter, not as top-level params.
+  const data = new URLSearchParams(window.location.search).get('data')
+
+  if (!data) {
+    return undefined
+  }
+
+  const params = new URLSearchParams(data)
+  const entityName = params.get('entityName') ?? ''
+  const recordId = (params.get('recordId') ?? '').replace(/[{}]/g, '')
+
+  if (!entityName && !recordId) {
+    return undefined
+  }
+
+  return { entityName, recordId }
+}
+
+async function fetchWorkflowStages(workflowId: string): Promise<{
+  rows: DataverseWorkflowStageRow[]
+  source: string
+}> {
+  const xrm = getXrmContext()
+
+  if (!xrm) {
+    throw new Error(
+      'Dataverse context is unavailable. Host this web resource in a model-driven app so Xrm.WebApi can run the OData query.',
+    )
+  }
+
+  const response = await xrm.WebApi.retrieveMultipleRecords<DataverseWorkflowStageRow>(
+    'usgs_workflowstage',
+    buildStagesQuery(workflowId),
+  )
+
+  return { rows: response.entities, source: 'Dataverse OData query' }
+}
+
+// Formats a Dataverse date string to mm/dd/yyyy. Reads the leading YYYY-MM-DD
+// directly (no Date parsing) to avoid timezone shifts on date-only values.
+function formatCompletedDate(value: string | null | undefined): string | undefined {
+  if (typeof value !== 'string' || value.length < 10) {
+    return undefined
+  }
+
+  const [year, month, day] = value.slice(0, 10).split('-')
+  return year && month && day ? `${month}/${day}/${year}` : undefined
+}
+
+// Reads this record's finalized tasks (statuscode 2) to reconstruct the path it
+// actually took. Returns:
+//  - completionByStage: stage GUID -> completed date, keyed by the task's "From"
+//    stage (finalizing a task completes its From stage on that date).
+//  - visitedStages: every stage the record genuinely passed through (the From
+//    and To of each finalized transition). Stages not in this set were skipped.
+async function fetchTaskHistory(): Promise<{
+  completionByStage: Map<string, string>
+  visitedStages: Set<string>
+}> {
+  const completionByStage = new Map<string, string>()
+  const visitedStages = new Set<string>()
+  const xrm = getXrmContext()
+  const formContext = getFormContext()
+
+  if (!xrm || !formContext?.recordId) {
+    return { completionByStage, visitedStages }
+  }
+
+  try {
+    const query =
+      '?$select=usgs_completeddate,_usgs_workflowstagefrom_value,_usgs_workflowstageto_value' +
+      `&$filter=_usgs_informationproductid_value eq ${formContext.recordId}` +
+      ' and statuscode eq 2'
+
+    const response = await xrm.WebApi.retrieveMultipleRecords<DataverseWorkflowTaskRow>(
+      'usgs_workflowtask',
+      query,
+    )
+
+    for (const task of response.entities) {
+      const fromStageId = asGuid(task._usgs_workflowstagefrom_value)
+      const toStageId = asGuid(task._usgs_workflowstageto_value)
+      const completedDate = task.usgs_completeddate
+
+      if (!toStageId || !fromStageId || !completedDate) {
+        continue
+      }
+
+      // Both endpoints of a finalized transition were actually visited.
+      visitedStages.add(fromStageId.toLowerCase())
+      visitedStages.add(toStageId.toLowerCase())
+
+      // The From stage is the one completed by this task; key the date by it.
+      // Keep the most recent completion if a stage was left more than once.
+      const key = fromStageId.toLowerCase()
+      const existing = completionByStage.get(key)
+      if (!existing || completedDate > existing) {
+        completionByStage.set(key, completedDate)
+      }
+    }
+  } catch {
+    // Leave the maps empty — stages still render, just unfiltered and undated.
+  }
+
+  return { completionByStage, visitedStages }
+}
+
+function asGuid(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.replace(/[{}]/g, '') : undefined
+}
+
+// Resolves the record's workflow context in a single retrieve: the record's
+// usgs_workflowstageid lookup gives the current stage, and expanding that
+// lookup's own usgs_workflow lookup gives the parent workflow used to filter
+// the stage list. Returns empties if context is missing, the lookup is unset,
+// or the retrieve fails — the visualization degrades gracefully.
+async function fetchRecordWorkflow(): Promise<{
+  stageId?: string
+  workflowId?: string
+}> {
+  const xrm = getXrmContext()
+  const formContext = getFormContext()
+
+  if (!xrm || !formContext?.entityName || !formContext?.recordId) {
+    return {}
+  }
+
+  try {
+    const record = await xrm.WebApi.retrieveRecord(
+      formContext.entityName,
+      formContext.recordId,
+      '?$select=_usgs_workflowstageid_value' +
+        '&$expand=usgs_WorkflowStageId($select=_usgs_workflow_value)',
+    )
+
+    const stageId = asGuid(record['_usgs_workflowstageid_value'])
+    const stage = record['usgs_WorkflowStageId'] as
+      | Record<string, unknown>
+      | null
+      | undefined
+    const workflowId = asGuid(stage?.['_usgs_workflow_value'])
+
+    return { stageId, workflowId }
+  } catch {
+    return {}
+  }
 }
 
 function normalizeWorkflowStages(rows: DataverseWorkflowStageRow[]): WorkflowStage[] {
   return rows
     .map((row) => ({
-      id: `${row['W.usgs_workflowid'] ?? 'workflow'}-${row.usgs_sequencenumber}`,
+      id:
+        row.usgs_workflowstageid ??
+        `${row.usgs_Workflow?.usgs_workflowid ?? 'workflow'}-${row.usgs_sequencenumber}`,
       stage: row.usgs_stage,
+      stageName: row.usgs_name,
       sequenceNumber: row.usgs_sequencenumber,
       description: row.usgs_description ?? '',
-      workflowName: row['W.usgs_name'] ?? 'Workflow',
-      workflowDescription: row['W.usgs_description'] ?? '',
+      workflowName: row.usgs_Workflow?.usgs_name ?? 'Workflow',
+      workflowDescription: row.usgs_Workflow?.usgs_description ?? '',
     }))
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber)
 }
 
-function getStageStatus(
-  sequenceNumber: number,
-  current: number,
-  destination: number,
-): StageStatus {
-  if (destination === current) {
-    return sequenceNumber < current
-      ? 'completed'
-      : sequenceNumber === current
-        ? 'inProgress'
-        : 'skipped'
-  }
-
-  if (destination > current) {
-    if (sequenceNumber <= current) {
-      return 'completed'
-    }
-
-    return sequenceNumber === destination ? 'inProgress' : 'skipped'
-  }
-
-  if (sequenceNumber < destination) {
+function getStageStatus(sequenceNumber: number, current: number): StageStatus {
+  if (sequenceNumber < current) {
     return 'completed'
   }
 
-  if (sequenceNumber <= current) {
-    return 'returned'
+  if (sequenceNumber === current) {
+    return 'inProgress'
   }
 
-  return 'skipped'
+  return 'upcoming'
 }
 
 function buildStageViewModels(
   stages: WorkflowStage[],
-  selectedAction: WorkflowAction,
+  currentSequence: number | null,
+  completionByStage: Map<string, string>,
+  visitedStages: Set<string>,
 ): StageViewModel[] {
-  return stages.map((stage) => ({
-    ...stage,
-    status: getStageStatus(
-      stage.sequenceNumber,
-      currentSequence,
-      selectedAction.targetSequence,
-    ),
-    isCurrent: stage.sequenceNumber === currentSequence,
-    isDestination: stage.sequenceNumber === selectedAction.targetSequence,
-  }))
+  return stages
+    .map((stage) => {
+      const status =
+        currentSequence === null
+          ? 'upcoming'
+          : getStageStatus(stage.sequenceNumber, currentSequence)
+
+      return {
+        ...stage,
+        status,
+        isCurrent: stage.sequenceNumber === currentSequence,
+        completedOn:
+          status === 'completed'
+            ? formatCompletedDate(completionByStage.get(stage.id.toLowerCase()))
+            : undefined,
+      }
+    })
+    .filter(
+      (stage) =>
+        // Past stages: keep only those the task history actually visited.
+        // Current and upcoming stages are always shown.
+        stage.status !== 'completed' ||
+        visitedStages.has(stage.id.toLowerCase()),
+    )
 }
 
 function StatusIcon({ status }: { status: StageStatus }) {
@@ -223,15 +324,9 @@ function StatusIcon({ status }: { status: StageStatus }) {
           <path d="M11 3v7h6a7 7 0 0 0-6-7Z" />
         </svg>
       )}
-      {iconType === 'skip' && (
+      {iconType === 'upcoming' && (
         <svg viewBox="0 0 20 20" focusable="false">
-          <path d="M4 9h8.2L9.6 6.4 11 5l5 5-5 5-1.4-1.4 2.6-2.6H4V9Z" />
-          <path d="M15 5h2v10h-2V5Z" />
-        </svg>
-      )}
-      {iconType === 'return' && (
-        <svg viewBox="0 0 20 20" focusable="false">
-          <path d="M8 4 3 9l5 5 1.4-1.4L6.8 10H13a3 3 0 0 1 0 6h-2v2h2a5 5 0 0 0 0-10H6.8l2.6-2.6L8 4Z" />
+          <path d="M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12Zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z" />
         </svg>
       )}
     </span>
@@ -239,102 +334,183 @@ function StatusIcon({ status }: { status: StageStatus }) {
 }
 
 function App() {
-  const stages = useMemo(() => normalizeWorkflowStages(workflowStageRows), [])
-  const [selectedActionId, setSelectedActionId] = useState(workflowActions[0].id)
+  const [rows, setRows] = useState<DataverseWorkflowStageRow[]>([])
+  const [loadState, setLoadState] = useState<LoadState>('loading')
+  const [sourceLabel, setSourceLabel] = useState('Loading workflow stages.')
+  const stages = useMemo(() => normalizeWorkflowStages(rows), [rows])
+  const [currentSequence, setCurrentSequence] = useState<number | null>(null)
+  const [currentWorkflowId, setCurrentWorkflowId] = useState<string | null>(null)
+  const [completionByStage, setCompletionByStage] = useState<Map<string, string>>(
+    () => new Map(),
+  )
+  const [visitedStages, setVisitedStages] = useState<Set<string>>(() => new Set())
+  // Query string is fixed for the lifetime of the resource, so read it once.
+  const [formContext] = useState<FormContext | undefined>(() => getFormContext())
 
-  const selectedAction =
-    workflowActions.find((action) => action.id === selectedActionId) ??
-    workflowActions[0]
+  useEffect(() => {
+    let active = true
+
+    async function loadStages() {
+      try {
+        setLoadState('loading')
+        setSourceLabel('Loading workflow stages.')
+
+        // Resolve the record's workflow and its completed-task dates together;
+        // both depend only on the record, not on the stage list.
+        const [{ stageId, workflowId }, taskHistory] = await Promise.all([
+          fetchRecordWorkflow(),
+          fetchTaskHistory(),
+        ])
+
+        if (!active) {
+          return
+        }
+
+        if (!workflowId) {
+          setSourceLabel(
+            'No workflow is associated with this record. Set the workflow stage to visualize the workflow.',
+          )
+          setLoadState('error')
+          return
+        }
+
+        setCurrentWorkflowId(workflowId)
+
+        const { rows: nextRows, source } = await fetchWorkflowStages(workflowId)
+
+        if (!active) {
+          return
+        }
+
+        // Map the record's current stage GUID to its sequence number.
+        const currentRow = stageId
+          ? nextRows.find(
+              (row) =>
+                row.usgs_workflowstageid?.toLowerCase() ===
+                stageId.toLowerCase(),
+            )
+          : undefined
+
+        setRows(nextRows)
+        setCurrentSequence(currentRow?.usgs_sequencenumber ?? null)
+        setCompletionByStage(taskHistory.completionByStage)
+        setVisitedStages(taskHistory.visitedStages)
+        setSourceLabel(source)
+        setLoadState('ready')
+      } catch (error) {
+        if (!active) {
+          return
+        }
+
+        setSourceLabel(
+          error instanceof Error
+            ? error.message
+            : 'Dataverse did not return workflow stages.',
+        )
+        setLoadState('error')
+      }
+    }
+
+    loadStages()
+
+    return () => {
+      active = false
+    }
+  }, [])
 
   const stageViewModels = useMemo(
-    () => buildStageViewModels(stages, selectedAction),
-    [selectedAction, stages],
+    () =>
+      buildStageViewModels(
+        stages,
+        currentSequence,
+        completionByStage,
+        visitedStages,
+      ),
+    [stages, currentSequence, completionByStage, visitedStages],
   )
 
   const currentStage = stages.find((stage) => stage.sequenceNumber === currentSequence)
-  const destinationStage = stages.find(
-    (stage) => stage.sequenceNumber === selectedAction.targetSequence,
-  )
-  const routeDirection =
-    selectedAction.targetSequence > currentSequence ? 'forward' : 'backward'
 
   return (
     <main className="appShell">
-      <section className="commandBar" aria-labelledby="workflow-title">
+      <section className="commandBar" aria-labelledby="workflow-title" hidden>
         <div className="workflowIntro">
-          <p className="eyebrow">USGS model-driven app resource</p>
-          <h1 id="workflow-title">{stages[0]?.workflowName}</h1>
-          <p>{stages[0]?.workflowDescription}</p>
-        </div>
-
-        <div className="actionPanel">
-          <label htmlFor="workflow-action">Selected action</label>
-          <select
-            id="workflow-action"
-            value={selectedActionId}
-            onChange={(event) => setSelectedActionId(event.target.value)}
-          >
-            {workflowActions.map((action) => (
-              <option key={action.id} value={action.id}>
-                {action.label}
-              </option>
-            ))}
-          </select>
-          <p id="route-summary" aria-live="polite">
-            {currentStage?.stage} routes {routeDirection} to{' '}
-            {destinationStage?.stage}. {selectedAction.helpText}
+          <p className="eyebrow">USGS model-driven app resource v2</p>
+          <h1 id="workflow-title">{stages[0]?.workflowName ?? 'Workflow'}</h1>
+          <p>
+            {stages[0]?.workflowDescription ??
+              'Workflow stages are loaded from Dataverse.'}
+          </p>
+          <p className="sourceNotice" aria-live="polite">
+            {sourceLabel}
           </p>
         </div>
       </section>
 
-      <section
-        className="workflowCanvas"
-        aria-labelledby="stepper-title"
-        aria-describedby="route-summary"
-      >
+      <section className="workflowCanvas" aria-labelledby="stepper-title">
         <div className="sectionHeader">
           <div>
-            <p className="eyebrow">Workflow stage table</p>
-            <h2 id="stepper-title">Stage route preview</h2>
+            <p className="eyebrow">{stages[0]?.workflowDescription}</p>
+            <h2 id="stepper-title">{stages[0]?.workflowName}</h2>
+            <p className="formContextNotice" hidden>
+              {formContext
+                ? `${formContext.entityName} · ${formContext.recordId || 'unsaved record'}`
+                : 'No form context — open this resource from a record form.'}
+            </p>
           </div>
-          <div className="routeMeta" aria-label="Route details">
-            <span>Current: {currentStage?.stage}</span>
-            <span>Destination: {destinationStage?.stage}</span>
+          <div className="routeMeta" aria-label="Route details" hidden>
+            <span>Current: {currentStage?.stage ?? 'Loading'}</span>
           </div>
         </div>
 
-        <ol className="stepper" aria-label="Workflow stages">
-          {stageViewModels.map((stage) => (
-            <li
-              className="step"
-              data-status={stage.status}
-              key={stage.id}
-              aria-current={stage.isDestination ? 'step' : undefined}
-            >
-              <div className="stepRail" aria-hidden="true"></div>
-              <div className="stepMarker">
-                <StatusIcon status={stage.status} />
-              </div>
-              <div className="stepContent">
-                <div className="stageTitleRow">
-                  <span className="stageNumber">
-                    Stage {stage.sequenceNumber}
-                  </span>
-                  <span className="statusPill">{statusContent[stage.status].label}</span>
+        {loadState === 'error' && (
+          <div className="emptyState" role="alert">
+            <h3>Unable to load workflow stages</h3>
+            <p>{sourceLabel}</p>
+          </div>
+        )}
+
+        {loadState !== 'error' && (
+          <ol
+            className="stepper"
+            aria-busy={loadState === 'loading'}
+            aria-label="Workflow stages"
+          >
+            {stageViewModels.map((stage) => (
+              <li
+                className="step"
+                data-status={stage.status}
+                key={stage.id}
+                aria-current={stage.isCurrent ? 'step' : undefined}
+              >
+                <div className="stepRail" aria-hidden="true"></div>
+                <div className="stepMarker">
+                  <StatusIcon status={stage.status} />
                 </div>
-                <h3>{stage.stage}</h3>
-                <p>{stage.description}</p>
-                <div className="stageTags" aria-label="Stage markers">
-                  {stage.isCurrent && <span>Current location</span>}
-                  {stage.isDestination && <span>Action destination</span>}
+                <div className="stepContent">
+                  <div className="stageTitleRow">
+                    <span className="stageNumber">
+                      Stage {stage.sequenceNumber}
+                    </span>
+                    <span className="statusPill">
+                      {stage.completedOn
+                        ? `Completed On ${stage.completedOn}`
+                        : statusContent[stage.status].label}
+                    </span>
+                  </div>
+                  <h3>{stage.stageName}</h3>
+                  <p>{stage.description}</p>
+                  {/* <div className="stageTags" aria-label="Stage markers">
+                    {stage.isCurrent && <span>Current location</span>}
+                  </div> */}
                 </div>
-              </div>
-            </li>
-          ))}
-        </ol>
+              </li>
+            ))}
+          </ol>
+        )}
       </section>
 
-      <aside className="supportingGrid" aria-label="Implementation notes">
+      <aside className="supportingGrid" aria-label="Implementation notes" hidden>
         <div className="legend" aria-label="Status legend">
           {Object.entries(statusContent).map(([status, content]) => (
             <div className="legendItem" data-status={status} key={status}>
@@ -345,8 +521,8 @@ function App() {
         </div>
 
         <details className="fetchPanel">
-          <summary>FetchXML source</summary>
-          <pre>{fetchXml}</pre>
+          <summary>OData query source</summary>
+          <pre>{buildStagesQuery(currentWorkflowId ?? '{workflow-id}')}</pre>
         </details>
       </aside>
     </main>
