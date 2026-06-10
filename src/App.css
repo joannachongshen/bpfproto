@@ -244,16 +244,50 @@
 .stepContent {
   display: grid;
   align-content: start;
-  gap: 8px;
   min-width: 0;
-  padding: 12px;
   border: 1px solid transparent;
   border-radius: var(--radius);
+  transition: background-color 0.15s, border-color 0.15s;
+  overflow: hidden;
+}
+
+.step:hover .stepContent {
+  background-color: rgba(0, 0, 0, 0.03);
+}
+
+.step[data-status='completed']:hover .stepContent {
+  background-color: var(--complete-bg);
+}
+
+.step[data-status='inProgress']:hover .stepContent {
+  background-color: var(--progress-bg);
 }
 
 .step[aria-current='step'] .stepContent {
   border-color: var(--status-color);
   box-shadow: inset 0 0 0 1px var(--status-color);
+}
+
+.stepHeader {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+  cursor: pointer;
+  outline: none;
+}
+
+.stepHeader:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+  border-radius: var(--radius);
+}
+
+.stepHeaderMain {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 6px;
 }
 
 .stageTitleRow {
@@ -283,6 +317,43 @@
   padding: 3px 8px;
 }
 
+.expandChevron {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 5px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+}
+
+.expandChevron svg {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.2s;
+}
+
+.expandChevron--open svg {
+  transform: rotate(180deg);
+}
+
+.completedText {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--complete);
+  margin: 0;
+}
+
+.commentBadge {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
 .stepContent h3 {
   font-size: 16px;
   line-height: 1.25;
@@ -291,6 +362,118 @@
 .stepContent p {
   font-size: 13px;
   line-height: 1.4;
+}
+
+.stageDetails {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.stageDescription {
+  font-size: 13px;
+  color: var(--usgs-green);
+  margin: 0;
+  line-height: 1.4;
+}
+
+.detailMeta {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.detailMetaLeft {
+  display: grid;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.detailUserLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.personIcon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  fill: currentColor;
+}
+
+.ownerLink {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--focus);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ownerLink:hover {
+  color: #003d7a;
+}
+
+.ownerLink:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.taskComment {
+  font-size: 13px;
+  color: var(--ink);
+  margin: 0;
+  margin-left: 18px;
+  padding: 7px 10px;
+  background: #f9f9f9;
+  border: 1px solid var(--line);
+  border-radius: 0 8px 8px;
+  line-height: 1.4;
+}
+
+.openTaskIconBtn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background-color 0.1s, border-color 0.1s, color 0.1s;
+}
+
+.openTaskIconBtn svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.openTaskIconBtn:hover {
+  background: rgba(0, 0, 0, 0.05);
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.openTaskIconBtn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
 .stageTags {
@@ -480,11 +663,15 @@
     align-self: start;
   }
 
-  .stepContent {
-    padding: 0 0 0 4px;
+  .stepHeader {
+    padding: 0 10px 0 4px;
   }
 
-  .step[aria-current='step'] .stepContent {
+  .step[aria-current='step'] .stepHeader {
+    padding: 10px 10px 8px;
+  }
+
+  .step[aria-current='step'] .stageDetails {
     padding: 10px;
   }
 

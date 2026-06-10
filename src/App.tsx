@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 type StageStatus = 'completed' | 'inProgress' | 'upcoming'
@@ -15,19 +15,36 @@ type WorkflowStage = {
   workflowDescription: string
 }
 
+type TaskDetail = {
+  taskId: string
+  comment?: string
+  ownerName?: string
+  ownerId?: string
+  ownerEntityType?: string
+}
+
 type DataverseWorkflowStageRow = {
   usgs_workflowstageid?: string
   usgs_stage: string
   usgs_name: string
   usgs_sequencenumber: number
   usgs_description?: string
-  // Parent workflow, returned nested via $expand=usgs_Workflow.
   usgs_Workflow?: {
     usgs_workflowid?: string
     usgs_name?: string
     usgs_description?: string
     usgs_stagescount?: number
   }
+}
+
+type DataverseWorkflowTaskRow = {
+  usgs_workflowtaskid?: string
+  usgs_completeddate?: string | null
+  usgs_comment?: string | null
+  statuscode?: number
+  _usgs_workflowstagefrom_value?: string | null
+  _usgs_workflowstageto_value?: string | null
+  _ownerid_value?: string | null
 }
 
 type FormContext = {
@@ -39,13 +56,11 @@ type StageViewModel = WorkflowStage & {
   status: StageStatus
   isCurrent: boolean
   completedOn?: string
-}
-
-type DataverseWorkflowTaskRow = {
-  usgs_completeddate?: string | null
-  statuscode?: number
-  _usgs_workflowstagefrom_value?: string | null
-  _usgs_workflowstageto_value?: string | null
+  taskId?: string
+  comment?: string
+  ownerName?: string
+  ownerId?: string
+  ownerEntityType?: string
 }
 
 type XrmWebApi = {
@@ -60,8 +75,31 @@ type XrmWebApi = {
   ) => Promise<Record<string, unknown>>
 }
 
+type XrmNavigation = {
+  navigateTo: (
+    pageInput: { pageType: 'entityrecord'; entityName: string; entityId: string },
+    navigationOptions?: { target: 1 | 2 },
+  ) => Promise<void>
+}
+
+// Form context exposed by the host page when this resource is embedded directly
+// on a form (Xrm.Page is deprecated but remains the only way for an independently
+// loaded web resource to read the form's current record).
+type XrmFormEntity = {
+  getId?: () => string
+  getEntityName?: () => string
+}
+
+type XrmPage = {
+  data?: {
+    entity?: XrmFormEntity
+  }
+}
+
 type XrmContext = {
   WebApi: XrmWebApi
+  Navigation?: XrmNavigation
+  Page?: XrmPage
 }
 
 declare global {
@@ -88,7 +126,6 @@ const statusContent: Record<StageStatus, { label: string; icon: string }> = {
 function getXrmContext(): XrmContext | undefined {
   if (window.Xrm?.WebApi) {
     return window.Xrm
-
   }
 
   try {
@@ -99,23 +136,54 @@ function getXrmContext(): XrmContext | undefined {
 }
 
 function getFormContext(): FormContext | undefined {
-  // navigateTo / pane.navigate delivers our custom fields as a single
-  // URL-encoded `data` query string parameter, not as top-level params.
+  // Side pane (navigateTo) delivers the record context as a single URL-encoded
+  // `data` query string parameter.
   const data = new URLSearchParams(window.location.search).get('data')
 
-  if (!data) {
-    return undefined
+  if (data) {
+    const params = new URLSearchParams(data)
+    const entityName = params.get('entityName') ?? ''
+    const recordId = (params.get('recordId') ?? '').replace(/[{}]/g, '')
+
+    if (entityName || recordId) {
+      return { entityName, recordId }
+    }
   }
 
-  const params = new URLSearchParams(data)
-  const entityName = params.get('entityName') ?? ''
-  const recordId = (params.get('recordId') ?? '').replace(/[{}]/g, '')
+  // Embedded directly on a form: read the host form's current record instead.
+  return getHostFormContext()
+}
 
-  if (!entityName && !recordId) {
-    return undefined
+// Reads the record context from the host form when this resource is embedded on
+// a form (no `data` query parameter). The form context lives on the parent
+// window's Xrm.Page; the iframe's own Xrm has WebApi but no form. Falls back to
+// self in case the host injects Xrm.Page directly.
+function getHostFormContext(): FormContext | undefined {
+  const candidates: (XrmContext | undefined)[] = []
+
+  try {
+    candidates.push(window.parent?.Xrm)
+  } catch {
+    // Cross-origin parent access can throw; ignore and try self.
+  }
+  candidates.push(window.Xrm)
+
+  for (const xrm of candidates) {
+    const entity = xrm?.Page?.data?.entity
+
+    if (!entity) {
+      continue
+    }
+
+    const entityName = entity.getEntityName?.() ?? ''
+    const recordId = (entity.getId?.() ?? '').replace(/[{}]/g, '')
+
+    if (entityName || recordId) {
+      return { entityName, recordId }
+    }
   }
 
-  return { entityName, recordId }
+  return undefined
 }
 
 async function fetchWorkflowStages(workflowId: string): Promise<{
@@ -149,30 +217,30 @@ function formatCompletedDate(value: string | null | undefined): string | undefin
   return year && month && day ? `${month}/${day}/${year}` : undefined
 }
 
-// Reads this record's finalized tasks (statuscode 2) to reconstruct the path it
-// actually took. Returns:
-//  - completionByStage: stage GUID -> completed date, keyed by the task's "From"
-//    stage (finalizing a task completes its From stage on that date).
-//  - visitedStages: every stage the record genuinely passed through (the From
-//    and To of each finalized transition). Stages not in this set were skipped.
+// Reads all tasks for this record to reconstruct the path it actually took.
+// Finalized tasks (statuscode 2) populate completionByStage, visitedStages, and
+// taskDetailByStage. Active tasks (any other statuscode) populate taskDetailByStage
+// for the in-progress stage so the assignee is visible there too.
 async function fetchTaskHistory(): Promise<{
   completionByStage: Map<string, string>
+  taskDetailByStage: Map<string, TaskDetail>
   visitedStages: Set<string>
 }> {
   const completionByStage = new Map<string, string>()
+  const taskDetailByStage = new Map<string, TaskDetail>()
   const visitedStages = new Set<string>()
   const xrm = getXrmContext()
   const formContext = getFormContext()
 
   if (!xrm || !formContext?.recordId) {
-    return { completionByStage, visitedStages }
+    return { completionByStage, taskDetailByStage, visitedStages }
   }
 
   try {
     const query =
-      '?$select=usgs_completeddate,_usgs_workflowstagefrom_value,_usgs_workflowstageto_value' +
-      `&$filter=_usgs_informationproductid_value eq ${formContext.recordId}` +
-      ' and statuscode eq 2'
+      '?$select=usgs_workflowtaskid,usgs_completeddate,usgs_comment,statuscode,_ownerid_value,' +
+      '_usgs_workflowstagefrom_value,_usgs_workflowstageto_value' +
+      `&$filter=_usgs_informationproductid_value eq ${formContext.recordId}`
 
     const response = await xrm.WebApi.retrieveMultipleRecords<DataverseWorkflowTaskRow>(
       'usgs_workflowtask',
@@ -181,41 +249,70 @@ async function fetchTaskHistory(): Promise<{
 
     for (const task of response.entities) {
       const fromStageId = asGuid(task._usgs_workflowstagefrom_value)
-      const toStageId = asGuid(task._usgs_workflowstageto_value)
-      const completedDate = task.usgs_completeddate
+      const taskId = task.usgs_workflowtaskid
 
-      if (!toStageId || !fromStageId || !completedDate) {
+      if (!fromStageId || !taskId) {
         continue
       }
 
-      // Both endpoints of a finalized transition were actually visited.
-      visitedStages.add(fromStageId.toLowerCase())
-      visitedStages.add(toStageId.toLowerCase())
+      // Xrm.WebApi includes OData annotations automatically in the response.
+      const raw = task as unknown as Record<string, unknown>
+      const ownerName = raw['_ownerid_value@OData.Community.Display.V1.FormattedValue'] as
+        | string
+        | undefined
+      const ownerId = asGuid(task._ownerid_value)
+      const ownerEntityType = raw[
+        '_ownerid_value@Microsoft.Dynamics.CRM.lookuplogicalname'
+      ] as string | undefined
 
-      // The From stage is the one completed by this task; key the date by it.
-      // Keep the most recent completion if a stage was left more than once.
       const key = fromStageId.toLowerCase()
-      const existing = completionByStage.get(key)
-      if (!existing || completedDate > existing) {
-        completionByStage.set(key, completedDate)
+
+      if (task.statuscode === 2) {
+        // Finalized task: records the completion of its From stage.
+        const toStageId = asGuid(task._usgs_workflowstageto_value)
+        const completedDate = task.usgs_completeddate
+
+        if (!toStageId || !completedDate) continue
+
+        visitedStages.add(key)
+        visitedStages.add(toStageId.toLowerCase())
+
+        const existing = completionByStage.get(key)
+        if (!existing || completedDate > existing) {
+          completionByStage.set(key, completedDate)
+          taskDetailByStage.set(key, {
+            taskId,
+            comment: task.usgs_comment ?? undefined,
+            ownerName,
+            ownerId,
+            ownerEntityType,
+          })
+        }
+      } else {
+        // Active task: show assignee on the in-progress stage. Finalized task
+        // for the same From stage (if any) takes precedence.
+        if (!completionByStage.has(key)) {
+          taskDetailByStage.set(key, {
+            taskId,
+            comment: task.usgs_comment ?? undefined,
+            ownerName,
+            ownerId,
+            ownerEntityType,
+          })
+        }
       }
     }
   } catch {
     // Leave the maps empty — stages still render, just unfiltered and undated.
   }
 
-  return { completionByStage, visitedStages }
+  return { completionByStage, taskDetailByStage, visitedStages }
 }
 
 function asGuid(value: unknown): string | undefined {
   return typeof value === 'string' ? value.replace(/[{}]/g, '') : undefined
 }
 
-// Resolves the record's workflow context in a single retrieve: the record's
-// usgs_workflowstageid lookup gives the current stage, and expanding that
-// lookup's own usgs_workflow lookup gives the parent workflow used to filter
-// the stage list. Returns empties if context is missing, the lookup is unset,
-// or the retrieve fails — the visualization degrades gracefully.
 async function fetchRecordWorkflow(): Promise<{
   stageId?: string
   workflowId?: string
@@ -280,6 +377,7 @@ function buildStageViewModels(
   stages: WorkflowStage[],
   currentSequence: number | null,
   completionByStage: Map<string, string>,
+  taskDetailByStage: Map<string, TaskDetail>,
   visitedStages: Set<string>,
 ): StageViewModel[] {
   return stages
@@ -289,23 +387,42 @@ function buildStageViewModels(
           ? 'upcoming'
           : getStageStatus(stage.sequenceNumber, currentSequence)
 
+      const key = stage.id.toLowerCase()
+      const taskDetail =
+        status === 'completed' || status === 'inProgress'
+          ? taskDetailByStage.get(key)
+          : undefined
+
       return {
         ...stage,
         status,
         isCurrent: stage.sequenceNumber === currentSequence,
         completedOn:
           status === 'completed'
-            ? formatCompletedDate(completionByStage.get(stage.id.toLowerCase()))
+            ? formatCompletedDate(completionByStage.get(key))
             : undefined,
+        taskId: taskDetail?.taskId,
+        comment: taskDetail?.comment,
+        ownerName: taskDetail?.ownerName,
+        ownerId: taskDetail?.ownerId,
+        ownerEntityType: taskDetail?.ownerEntityType,
       }
     })
     .filter(
       (stage) =>
-        // Past stages: keep only those the task history actually visited.
-        // Current and upcoming stages are always shown.
         stage.status !== 'completed' ||
         visitedStages.has(stage.id.toLowerCase()),
     )
+}
+
+function navigateToRecord(entityName: string, entityId: string) {
+  const xrm = getXrmContext()
+  if (!xrm?.Navigation) return
+
+  void xrm.Navigation.navigateTo(
+    { pageType: 'entityrecord', entityName, entityId },
+    { target: 1 },
+  )
 }
 
 function StatusIcon({ status }: { status: StageStatus }) {
@@ -333,6 +450,52 @@ function StatusIcon({ status }: { status: StageStatus }) {
   )
 }
 
+function ChevronIcon({ expanded }: { expanded: boolean }) {
+  return (
+    <span
+      className={`expandChevron${expanded ? ' expandChevron--open' : ''}`}
+      aria-hidden="true"
+    >
+      <svg viewBox="0 0 16 16" focusable="false">
+        <path
+          d="M4 6l4 4 4-4"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          fill="none"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </span>
+  )
+}
+
+function PersonIcon() {
+  return (
+    <svg className="personIcon" viewBox="0 0 20 20" focusable="false" aria-hidden="true">
+      <circle cx="10" cy="7" r="3" />
+      <path d="M4 17c0-3.3 2.7-6 6-6s6 2.7 6 6h-1.5c0-2.5-2-4.5-4.5-4.5S5.5 14.5 5.5 17z" />
+    </svg>
+  )
+}
+
+function OpenInNewIcon() {
+  return (
+    <svg viewBox="0 0 20 20" focusable="false" aria-hidden="true">
+      <path d="M12 4h4v4l-1.5-1.5-4.5 4.5-1-1 4.5-4.5z" />
+      <path d="M10 5H6a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-4h-1.5V14H6.5V6.5H10z" />
+    </svg>
+  )
+}
+
+function CommentBadge() {
+  return (
+    <svg className="commentBadge" viewBox="0 0 16 16" focusable="false" aria-label="Has comment">
+      <path d="M2 1h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H9l-2 2.5L5 10H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1z" />
+    </svg>
+  )
+}
+
 function App() {
   const [rows, setRows] = useState<DataverseWorkflowStageRow[]>([])
   const [loadState, setLoadState] = useState<LoadState>('loading')
@@ -343,9 +506,24 @@ function App() {
   const [completionByStage, setCompletionByStage] = useState<Map<string, string>>(
     () => new Map(),
   )
+  const [taskDetailByStage, setTaskDetailByStage] = useState<Map<string, TaskDetail>>(
+    () => new Map(),
+  )
   const [visitedStages, setVisitedStages] = useState<Set<string>>(() => new Set())
-  // Query string is fixed for the lifetime of the resource, so read it once.
+  const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(() => new Set())
   const [formContext] = useState<FormContext | undefined>(() => getFormContext())
+
+  const toggleStage = useCallback((id: string) => {
+    setExpandedStageIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -355,8 +533,6 @@ function App() {
         setLoadState('loading')
         setSourceLabel('Loading workflow stages.')
 
-        // Resolve the record's workflow and its completed-task dates together;
-        // both depend only on the record, not on the stage list.
         const [{ stageId, workflowId }, taskHistory] = await Promise.all([
           fetchRecordWorkflow(),
           fetchTaskHistory(),
@@ -382,18 +558,17 @@ function App() {
           return
         }
 
-        // Map the record's current stage GUID to its sequence number.
         const currentRow = stageId
           ? nextRows.find(
               (row) =>
-                row.usgs_workflowstageid?.toLowerCase() ===
-                stageId.toLowerCase(),
+                row.usgs_workflowstageid?.toLowerCase() === stageId.toLowerCase(),
             )
           : undefined
 
         setRows(nextRows)
         setCurrentSequence(currentRow?.usgs_sequencenumber ?? null)
         setCompletionByStage(taskHistory.completionByStage)
+        setTaskDetailByStage(taskHistory.taskDetailByStage)
         setVisitedStages(taskHistory.visitedStages)
         setSourceLabel(source)
         setLoadState('ready')
@@ -424,9 +599,10 @@ function App() {
         stages,
         currentSequence,
         completionByStage,
+        taskDetailByStage,
         visitedStages,
       ),
-    [stages, currentSequence, completionByStage, visitedStages],
+    [stages, currentSequence, completionByStage, taskDetailByStage, visitedStages],
   )
 
   const currentStage = stages.find((stage) => stage.sequenceNumber === currentSequence)
@@ -476,36 +652,102 @@ function App() {
             aria-busy={loadState === 'loading'}
             aria-label="Workflow stages"
           >
-            {stageViewModels.map((stage) => (
-              <li
-                className="step"
-                data-status={stage.status}
-                key={stage.id}
-                aria-current={stage.isCurrent ? 'step' : undefined}
-              >
-                <div className="stepRail" aria-hidden="true"></div>
-                <div className="stepMarker">
-                  <StatusIcon status={stage.status} />
-                </div>
-                <div className="stepContent">
-                  <div className="stageTitleRow">
-                    <span className="stageNumber">
-                      Stage {stage.sequenceNumber}
-                    </span>
-                    <span className="statusPill">
-                      {stage.completedOn
-                        ? `Completed On ${stage.completedOn}`
-                        : statusContent[stage.status].label}
-                    </span>
+            {stageViewModels.map((stage) => {
+              const isExpanded = expandedStageIds.has(stage.id)
+              const hasDetails =
+                !!stage.description ||
+                !!stage.comment ||
+                !!stage.ownerName ||
+                !!stage.taskId
+
+              return (
+                <li
+                  className="step"
+                  data-status={stage.status}
+                  key={stage.id}
+                  aria-current={stage.isCurrent ? 'step' : undefined}
+                >
+                  <div className="stepRail" aria-hidden="true"></div>
+                  <div className="stepMarker">
+                    <StatusIcon status={stage.status} />
                   </div>
-                  <h3>{stage.stageName}</h3>
-                  <p>{stage.description}</p>
-                  {/* <div className="stageTags" aria-label="Stage markers">
-                    {stage.isCurrent && <span>Current location</span>}
-                  </div> */}
-                </div>
-              </li>
-            ))}
+                  <div className="stepContent">
+                    <div
+                      className="stepHeader"
+                      onClick={() => toggleStage(stage.id)}
+                      tabIndex={0}
+                      aria-expanded={isExpanded}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          toggleStage(stage.id)
+                        }
+                      }}
+                    >
+                      <div className="stepHeaderMain">
+                        <div className="stageTitleRow">
+                          <span className="statusPill">
+                            {statusContent[stage.status].label}
+                          </span>
+                        </div>
+                        <h3>{stage.stageName}</h3>
+                        {stage.completedOn && (
+                          <p className="completedText">
+                            {stage.completedOn}
+                            {stage.comment && <CommentBadge />}
+                          </p>
+                        )}
+                      </div>
+                      {hasDetails && <ChevronIcon expanded={isExpanded} />}
+                    </div>
+
+                    {isExpanded && hasDetails && (
+                      <div className="stageDetails">
+                        {stage.description && (
+                          <p className="stageDescription">{stage.description}</p>
+                        )}
+                        <div className="detailMeta">
+                          <div className="detailMetaLeft">
+                            {stage.ownerName && (
+                              <span className="detailUserLine">
+                                <PersonIcon />
+                                {stage.ownerId && stage.ownerEntityType ? (
+                                  <button
+                                    className="ownerLink"
+                                    onClick={() =>
+                                      navigateToRecord(
+                                        stage.ownerEntityType!,
+                                        stage.ownerId!,
+                                      )
+                                    }
+                                  >
+                                    {stage.ownerName}
+                                  </button>
+                                ) : (
+                                  <span>{stage.ownerName}</span>
+                                )}
+                              </span>
+                            )}
+                            {stage.comment && (
+                              <p className="taskComment">{stage.comment}</p>
+                            )}
+                          </div>
+                          {stage.taskId && (
+                            <button
+                              className="openTaskIconBtn"
+                              title="Open task record"
+                              onClick={() => navigateToRecord('usgs_workflowtask', stage.taskId!)}
+                            >
+                              <OpenInNewIcon />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </li>
+              )
+            })}
           </ol>
         )}
       </section>
