@@ -64,6 +64,9 @@ export default defineConfig({
   build: {
     assetsInlineLimit: 0,
     copyPublicDir: false,
+    // Inline a source map so the minified bundle maps back to the original
+    // TypeScript in DevTools, keeping the shipped resource small.
+    sourcemap: 'inline',
   },
   plugins: [react(), inlineBundleAssets()],
 })
