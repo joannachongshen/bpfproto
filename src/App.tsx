@@ -82,6 +82,26 @@ type XrmNavigation = {
   ) => Promise<void>
 }
 
+// Side panes are owned by the top-level app window, so this is read from the
+// host (parent) Xrm rather than the iframe's own Xrm.
+type XrmSidePane = {
+  close: () => void
+}
+
+type XrmApp = {
+  sidePanes?: {
+    getPane?: (paneId: string) => XrmSidePane | undefined
+  }
+}
+
+// Supported replacement for the deprecated Xrm.Page: reports the page currently
+// shown in the app's main area and updates as the user navigates.
+type XrmUtility = {
+  getPageContext?: () => {
+    input?: { pageType?: string; entityName?: string; entityId?: string }
+  } | undefined
+}
+
 // Form context exposed by the host page when this resource is embedded directly
 // on a form (Xrm.Page is deprecated but remains the only way for an independently
 // loaded web resource to read the form's current record).
@@ -100,6 +120,8 @@ type XrmContext = {
   WebApi: XrmWebApi
   Navigation?: XrmNavigation
   Page?: XrmPage
+  App?: XrmApp
+  Utility?: XrmUtility
 }
 
 declare global {
@@ -107,6 +129,11 @@ declare global {
     Xrm?: XrmContext
   }
 }
+
+// The entity this resource is meant to accompany. When the host form moves to
+// any other entity (or no record at all), the side pane should close itself.
+const INFORMATION_PRODUCT_ENTITY = 'usgs_informationproduct'
+const SIDE_PANE_ID = 'WorkflowVisualizationPane'
 
 function buildStagesQuery(workflowId: string): string {
   return [
@@ -136,19 +163,19 @@ function getXrmContext(): XrmContext | undefined {
 }
 
 function getFormContext(): FormContext | undefined {
-  // Side pane (navigateTo) delivers the record context as a single URL-encoded
-  // `data` query string parameter.
-  const data = new URLSearchParams(window.location.search).get('data')
+  // // Side pane (navigateTo) delivers the record context as a single URL-encoded
+  // // `data` query string parameter.
+  // const data = new URLSearchParams(window.location.search).get('data')
 
-  if (data) {
-    const params = new URLSearchParams(data)
-    const entityName = params.get('entityName') ?? ''
-    const recordId = (params.get('recordId') ?? '').replace(/[{}]/g, '')
+  // if (data) {
+  //   const params = new URLSearchParams(data)
+  //   const entityName = params.get('entityName') ?? ''
+  //   const recordId = (params.get('recordId') ?? '').replace(/[{}]/g, '')
 
-    if (entityName || recordId) {
-      return { entityName, recordId }
-    }
-  }
+  //   if (entityName || recordId) {
+  //     return { entityName, recordId }
+  //   }
+  // }
 
   // Embedded directly on a form: read the host form's current record instead.
   return getHostFormContext()
@@ -184,6 +211,115 @@ function getHostFormContext(): FormContext | undefined {
   }
 
   return undefined
+}
+
+// Returns the host (parent app) Xrm that owns the side panes. Falls back to the
+// iframe's own Xrm if the parent is unreachable (e.g. cross-origin).
+function getHostXrm(): XrmContext | undefined {
+  try {
+    if (window.parent?.Xrm) {
+      return window.parent.Xrm
+    }
+  } catch {
+    // Cross-origin parent access can throw; fall back to self.
+  }
+  console.log("getHostXrm: ", window.Xrm);
+  return window.Xrm
+}
+
+// The page that currently fills the app's main area. `pageType` distinguishes a
+// record form ('entityrecord') from a view/grid ('entitylist'), which both carry
+// the same `etn`, so it is needed to tell "on the record" from "on the list".
+type MainPage = { entityName?: string; pageType?: string }
+
+// Reports the page currently shown in the app's main area, used to decide when
+// the side pane should close. Xrm.Page can't be used here: it is a deprecated
+// global that caches the last-opened form and keeps returning that entity even
+// after the user navigates to a view, dashboard, or different record. We use the
+// supported getPageContext() API, falling back to the main-window URL (its
+// `etn`/`pagetype` query params track navigation) if that API is unavailable.
+function getMainPage(): MainPage {
+  // Preferred: supported current-page API on the host Xrm.
+  try {
+    const input = getHostXrm()?.Utility?.getPageContext?.()?.input
+    if (input?.entityName) {
+      return { entityName: input.entityName, pageType: input.pageType }
+    }
+  } catch {
+    // getPageContext can throw when no page is active; fall through to the URL.
+  }
+
+  // Fallback: the app shell URL. Same-origin, so top/parent are readable.
+  const frames: (Window | undefined)[] = []
+  try {
+    frames.push(window.top ?? undefined)
+  } catch {
+    // Cross-origin access can throw; skip this frame.
+  }
+  try {
+    frames.push(window.parent ?? undefined)
+  } catch {
+    // Cross-origin access can throw; skip this frame.
+  }
+
+  for (const frame of frames) {
+    if (!frame) {
+      continue
+    }
+
+    try {
+      const fromSearch = readMainPageFromParams(
+        new URLSearchParams(frame.location.search),
+      )
+      if (fromSearch) {
+        return fromSearch
+      }
+
+      // Some navigations carry the params in the hash instead of the query.
+      const fromHash = readMainPageFromParams(
+        new URLSearchParams(frame.location.hash.replace(/^#/, '')),
+      )
+      if (fromHash) {
+        return fromHash
+      }
+    } catch {
+      // Cross-origin frame; skip.
+    }
+  }
+
+  return {}
+}
+
+// Pulls the page descriptor out of a parsed URL query/hash, or undefined when no
+// entity is present (e.g. a dashboard or home page).
+function readMainPageFromParams(params: URLSearchParams): MainPage | undefined {
+  const entityName = params.get('etn')
+  if (!entityName) {
+    return undefined
+  }
+
+  return { entityName, pageType: params.get('pagetype') ?? undefined }
+}
+
+// True only when the app's main area is showing a usgs_informationproduct record
+// form. A view/list of the same entity (pageType 'entitylist') returns false, so
+// the side pane closes when the user leaves the record itself.
+function isOnInformationProductRecord(): boolean {
+  const page = getMainPage()
+  return (
+    page.entityName === INFORMATION_PRODUCT_ENTITY &&
+    page.pageType === 'entityrecord'
+  )
+}
+
+// Closes the workflow side pane if it is still open. Safe to call repeatedly.
+function closeWorkflowPane() {
+  try {
+    const pane = getHostXrm()?.App?.sidePanes?.getPane?.(SIDE_PANE_ID)
+    pane?.close()
+  } catch {
+    // Pane may already be gone or the API unavailable; nothing to close.
+  }
 }
 
 async function fetchWorkflowStages(workflowId: string): Promise<{
@@ -591,6 +727,20 @@ function App() {
     return () => {
       active = false
     }
+  }, [])
+
+  // The side pane has no "form close" event, so poll the app's main area every
+  // 5 seconds. The pane stays only while a usgs_informationproduct *record form*
+  // is open; navigating to its view/list, another entity, or no record at all
+  // closes it. Reads the live main-window URL rather than the stale Xrm.Page.
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      if (!isOnInformationProductRecord()) {
+        closeWorkflowPane()
+      }
+    }, 5000)
+
+    return () => window.clearInterval(intervalId)
   }, [])
 
   const stageViewModels = useMemo(
