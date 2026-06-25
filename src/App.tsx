@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
-type StageStatus = 'completed' | 'inProgress' | 'upcoming'
+type StageStatus = 'completed' | 'inProgress' | 'upcoming' | 'returned'
 
 type LoadState = 'loading' | 'ready' | 'error'
 
@@ -21,6 +21,7 @@ type TaskDetail = {
   ownerName?: string
   ownerId?: string
   ownerEntityType?: string
+  dueDate?: string
 }
 
 type DataverseWorkflowStageRow = {
@@ -61,6 +62,7 @@ type StageViewModel = WorkflowStage & {
   ownerName?: string
   ownerId?: string
   ownerEntityType?: string
+  dueDate?: string
 }
 
 type XrmWebApi = {
@@ -127,6 +129,9 @@ type XrmContext = {
 declare global {
   interface Window {
     Xrm?: XrmContext
+    // Exposed by the visualizer so the host form's JavaScript can force a
+    // refresh (e.g. from a task subgrid OnSave handler) without a page reload.
+    refreshWorkflowVisualizer?: () => void
   }
 }
 
@@ -134,6 +139,292 @@ declare global {
 // any other entity (or no record at all), the side pane should close itself.
 const INFORMATION_PRODUCT_ENTITY = 'usgs_informationproduct'
 const SIDE_PANE_ID = 'WorkflowVisualizationPane'
+
+// ---------------------------------------------------------------------------
+// Deployment configuration — adjust to match the Dataverse schema and data.
+// ---------------------------------------------------------------------------
+
+// Logical (schema) name of the "requested due date" column on usgs_workflowtask.
+// Change this if the column is named differently in your environment.
+const TASK_DUE_DATE_FIELD = 'usgs_requestduedate'
+
+// How often (ms) to silently re-fetch so task updates appear without a manual
+// reload. Also exposed as window.refreshWorkflowVisualizer() for the host form.
+const REFRESH_INTERVAL_MS = 30000
+
+// Stages that are NOT part of the standard forward path — comment reconciliation
+// and address-comments stages. They are hidden unless the record was actually
+// routed through them. Matched (case-insensitive) against the stage name. Note
+// the standard "Peer Review and Reconciliation" stage is intentionally NOT
+// matched. A dedicated boolean column on usgs_workflowstage would be more robust
+// than name matching; see the accompanying notes.
+const OFF_PATH_STAGE_PATTERNS: RegExp[] = [
+  /comment reconciliation/i,
+  /address comments/i,
+  /^reconciliation\b/i,
+]
+
+function isOffPathStage(stageName: string): boolean {
+  return OFF_PATH_STAGE_PATTERNS.some((pattern) => pattern.test(stageName))
+}
+
+// ---------------------------------------------------------------------------
+// Workflow group determination. There is no stored "group" column on the IP
+// record; the group is computed in code from the general-tab fields the user
+// selects (product type, interpretive content, special product alert,
+// publication outlet, peer-review/open-access flags), following the IPDS routing
+// rules — see determineGroup(). The computed group selects one of GROUP_PATHS.
+// ---------------------------------------------------------------------------
+
+// Canonical workflow paths per group, transcribed from the approved IPDS
+// workflow configuration spreadsheet. These are the ONLY stages a record in a
+// given group can display (plus any stage it has actually visited). Stage names
+// must match usgs_workflowstage.usgs_name (compared case-insensitively).
+// Update these lists whenever the IPDS spreadsheet changes.
+const GROUP_PATHS: Record<string, string[]> = {
+  '1': [
+    'Prepare Record',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Dissemination',
+  ],
+  '2': [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Supervisory Approval',
+    'Center Approval',
+    'Dissemination',
+  ],
+  '3': [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Dissemination',
+  ],
+  '4': [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Upload Accepted Manuscript',
+    'SPN Production of Accepted Manuscript',
+    'Dissemination',
+  ],
+  '5': ['Prepare Record', 'Dissemination'],
+  '6': [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Approve for SPN Edit',
+    'Prepare for SPN Edit',
+    'Initial SPN Edit',
+    'Response to SPN Edit',
+    'SPN Edit Approval',
+    'Supervisory Approval',
+    'Center Approval',
+    'Prepare for SPN Production',
+    'SPN Production',
+    'Response to SPN Author Proof',
+    'Web Citation Page',
+    'Response to Web Citation Page',
+    'Dissemination',
+  ],
+  '7': [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Approve for SPN Edit',
+    'Prepare for SPN Edit',
+    'Initial SPN Edit',
+    'Response to SPN Edit',
+    'SPN Edit Approval',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Prepare for SPN Production',
+    'SPN Production',
+    'Response to SPN Author Proof',
+    'Web Citation Page',
+    'Response to Web Citation Page',
+    'Dissemination',
+  ],
+}
+
+// Returns the ordered stage-name set for a group key (lowercased for matching),
+// or null for an unknown/absent key.
+function groupPathSet(groupKey: string | null): Set<string> | null {
+  if (!groupKey) {
+    return null
+  }
+  const path = GROUP_PATHS[groupKey]
+  return path ? new Set(path.map((name) => name.toLowerCase())) : null
+}
+
+// --- Field bindings (PLACEHOLDERS) -----------------------------------------
+// Logical names of the usgs_informationproduct columns that drive routing.
+// REPLACE these with the real schema names from your environment. The routing
+// logic in determineGroup() is complete and does not change — only these
+// bindings and the value comparisons in readWorkflowInputs() do.
+const IP_FIELDS = {
+  productType: 'usgs_producttype',
+  // Interpretive content: "low" = noninterpretive OR interpretive based on
+  // previously approved products; "new" = contains new interpretive content.
+  interpretiveContent: 'usgs_interpretivecontent',
+  specialProductAlert: 'usgs_specialproductalert',
+  publicationOutlet: 'usgs_publicationoutlet',
+  peerReviewRequired: 'usgs_peerreviewrequired',
+  openAccess: 'usgs_openaccess',
+} as const
+
+// Every column the determination logic reads, for the IP $select.
+const IP_ROUTING_SELECT = Object.values(IP_FIELDS).join(',')
+
+type ProductCategory =
+  | 'simpleOptionalPeerReview' // Abstract or summary, Poster or presentation, USGS web page
+  | 'newsMedia' // Science news article, news release, social media, blog, etc.
+  | 'standardPublication' // Atlas, Book, Map (non-USGS series), Thesis, etc.
+  | 'dataSoftware' // Data release, Software release, Geonarrative, online DB / web data service
+  | 'journal' // Journal or periodical article
+  | 'alwaysGroup3' // Book review, Technical comment and reply, Preprint
+  | 'usgsPublication' // USGS series publications, Nonseries USGS publications
+  | 'extramural' // Extramural publication
+
+// Maps each product-type value to a routing category. Keys are the
+// usgs_producttype values in YOUR environment (option-set labels are read via
+// the OData formatted value, so human-readable keys like 'Atlas' work). REPLACE
+// the placeholder keys with the real values; the categories on the right are
+// correct per the IPDS rules and should not need changing.
+const PRODUCT_TYPE_CATEGORY: Record<string, ProductCategory> = {
+  // 'Abstract or summary': 'simpleOptionalPeerReview',
+  // 'Poster or presentation': 'simpleOptionalPeerReview',
+  // 'USGS web page': 'simpleOptionalPeerReview',
+  // 'Science news article': 'newsMedia',
+  // 'News release': 'newsMedia',
+  // 'Social media, audiovisual product, or blog': 'newsMedia',
+  // 'Atlas': 'standardPublication',
+  // 'Book, book chapter, encyclopedia entry, or guidebook': 'standardPublication',
+  // 'Map (non-USGS series)': 'standardPublication',
+  // 'Thesis': 'standardPublication',
+  // 'Data Release': 'dataSoftware',
+  // 'Software release': 'dataSoftware',
+  // 'USGS Geonarrative': 'dataSoftware',
+  // 'Journal or periodical article': 'journal',
+  // 'Book review, technical comment and reply': 'alwaysGroup3',
+  // 'Preprint': 'alwaysGroup3',
+  // 'USGS series publications': 'usgsPublication',
+  // 'Nonseries USGS publications': 'usgsPublication',
+  // 'Extramural publication': 'extramural',
+}
+
+type WorkflowInputs = {
+  productCategory: ProductCategory | null
+  contentInterpretive: 'low' | 'new' | null
+  specialProductAlert: boolean
+  publicationOutlet: 'nonScientificNewsMedia' | 'scienceOutlet' | null
+  peerReviewRequired: boolean
+  openAccess: boolean
+}
+
+// Reads an option-set/lookup column as its display label when available (so the
+// maps above can use readable values), falling back to the raw stored value.
+function readLabel(record: Record<string, unknown>, logicalName: string): string {
+  const formatted =
+    record[`${logicalName}@OData.Community.Display.V1.FormattedValue`]
+  return String(formatted ?? record[logicalName] ?? '')
+}
+
+function isTruthy(value: unknown): boolean {
+  return (
+    value === true ||
+    value === 1 ||
+    value === '1' ||
+    /^(true|yes)$/i.test(String(value ?? ''))
+  )
+}
+
+// Reads the routing inputs off the saved IP record. The value comparisons below
+// are PLACEHOLDERS — adjust them to your option-set labels/values.
+function readWorkflowInputs(record: Record<string, unknown>): WorkflowInputs {
+  const productCategory =
+    PRODUCT_TYPE_CATEGORY[readLabel(record, IP_FIELDS.productType)] ?? null
+
+  const interpretive = readLabel(record, IP_FIELDS.interpretiveContent)
+  const contentInterpretive: 'low' | 'new' | null =
+    interpretive === '' ? null : /new/i.test(interpretive) ? 'new' : 'low'
+
+  const outlet = readLabel(record, IP_FIELDS.publicationOutlet)
+  const publicationOutlet: WorkflowInputs['publicationOutlet'] =
+    outlet === ''
+      ? null
+      : /scien/i.test(outlet)
+        ? 'scienceOutlet'
+        : 'nonScientificNewsMedia'
+
+  // Treat a Special Product Alert as present when the field is set to anything
+  // other than empty / "None" (handles both an option set and a yes/no field).
+  const alert = readLabel(record, IP_FIELDS.specialProductAlert)
+  const specialProductAlert = alert !== '' && !/^(none|no)$/i.test(alert)
+
+  return {
+    productCategory,
+    contentInterpretive,
+    specialProductAlert,
+    publicationOutlet,
+    peerReviewRequired: isTruthy(record[IP_FIELDS.peerReviewRequired]),
+    openAccess: isTruthy(record[IP_FIELDS.openAccess]),
+  }
+}
+
+// Applies the IPDS routing rules to pick a group ('1'..'7'), or null when it
+// can't be determined yet (e.g. product type not selected). This encodes the
+// business rules; keep it aligned with the IPDS routing spreadsheet.
+function determineGroup(input: WorkflowInputs): string | null {
+  // New interpretive content or a Special Product Alert escalate the overlapping
+  // product types from their optional-BAO group to the required-BAO group.
+  const escalate = input.contentInterpretive === 'new' || input.specialProductAlert
+
+  switch (input.productCategory) {
+    case 'extramural':
+      return '5'
+
+    case 'alwaysGroup3':
+      return '3'
+
+    case 'dataSoftware':
+      return '2'
+
+    case 'journal':
+      // Open access -> Group 3; otherwise the non-open-access journal path.
+      return input.openAccess ? '3' : '4'
+
+    case 'simpleOptionalPeerReview':
+      return input.peerReviewRequired ? '2' : '1'
+
+    case 'newsMedia':
+      // Scientific outlet, special alert, or new interpretive content escalate to
+      // the required-BAO group; otherwise non-scientific media path keyed by PR.
+      if (input.publicationOutlet === 'scienceOutlet' || escalate) {
+        return '3'
+      }
+      return input.peerReviewRequired ? '2' : '1'
+
+    case 'standardPublication':
+      return escalate ? '3' : '2'
+
+    case 'usgsPublication':
+      return escalate ? '7' : '6'
+
+    default:
+      return null
+  }
+}
 
 function buildStagesQuery(workflowId: string): string {
   return [
@@ -148,6 +439,7 @@ const statusContent: Record<StageStatus, { label: string; icon: string }> = {
   completed: { label: 'Completed', icon: 'check' },
   inProgress: { label: 'In progress', icon: 'progress' },
   upcoming: { label: 'Upcoming', icon: 'upcoming' },
+  returned: { label: 'Returned', icon: 'progress' },
 }
 
 function getXrmContext(): XrmContext | undefined {
@@ -223,7 +515,6 @@ function getHostXrm(): XrmContext | undefined {
   } catch {
     // Cross-origin parent access can throw; fall back to self.
   }
-  console.log("getHostXrm: ", window.Xrm);
   return window.Xrm
 }
 
@@ -344,7 +635,7 @@ async function fetchWorkflowStages(workflowId: string): Promise<{
 
 // Formats a Dataverse date string to mm/dd/yyyy. Reads the leading YYYY-MM-DD
 // directly (no Date parsing) to avoid timezone shifts on date-only values.
-function formatCompletedDate(value: string | null | undefined): string | undefined {
+function formatDate(value: string | null | undefined): string | undefined {
   if (typeof value !== 'string' || value.length < 10) {
     return undefined
   }
@@ -374,7 +665,7 @@ async function fetchTaskHistory(): Promise<{
 
   try {
     const query =
-      '?$select=usgs_workflowtaskid,usgs_completeddate,usgs_comment,statuscode,_ownerid_value,' +
+      `?$select=usgs_workflowtaskid,usgs_completeddate,usgs_comment,statuscode,_ownerid_value,${TASK_DUE_DATE_FIELD},` +
       '_usgs_workflowstagefrom_value,_usgs_workflowstageto_value' +
       `&$filter=_usgs_informationproductid_value eq ${formContext.recordId}`
 
@@ -400,6 +691,7 @@ async function fetchTaskHistory(): Promise<{
       const ownerEntityType = raw[
         '_ownerid_value@Microsoft.Dynamics.CRM.lookuplogicalname'
       ] as string | undefined
+      const dueDate = formatDate(raw[TASK_DUE_DATE_FIELD] as string | undefined)
 
       const key = fromStageId.toLowerCase()
 
@@ -422,6 +714,7 @@ async function fetchTaskHistory(): Promise<{
             ownerName,
             ownerId,
             ownerEntityType,
+            dueDate,
           })
         }
       } else {
@@ -434,6 +727,7 @@ async function fetchTaskHistory(): Promise<{
             ownerName,
             ownerId,
             ownerEntityType,
+            dueDate,
           })
         }
       }
@@ -452,6 +746,7 @@ function asGuid(value: unknown): string | undefined {
 async function fetchRecordWorkflow(): Promise<{
   stageId?: string
   workflowId?: string
+  groupPath?: Set<string> | null
 }> {
   const xrm = getXrmContext()
   const formContext = getFormContext()
@@ -474,10 +769,31 @@ async function fetchRecordWorkflow(): Promise<{
       | null
       | undefined
     const workflowId = asGuid(stage?.['_usgs_workflow_value'])
+    const groupPath = await fetchGroupPath(xrm, formContext)
 
-    return { stageId, workflowId }
+    return { stageId, workflowId, groupPath }
   } catch {
     return {}
+  }
+}
+
+// Reads the IP record's routing fields and computes its group path. Kept in a
+// separate, independently-guarded request so that an incorrect field-binding
+// (the IP_FIELDS placeholders) only disables grouping — the stage list still
+// renders, just unfiltered by group.
+async function fetchGroupPath(
+  xrm: XrmContext,
+  formContext: FormContext,
+): Promise<Set<string> | null> {
+  try {
+    const record = await xrm.WebApi.retrieveRecord(
+      formContext.entityName,
+      formContext.recordId,
+      `?$select=${IP_ROUTING_SELECT}`,
+    )
+    return groupPathSet(determineGroup(readWorkflowInputs(record)))
+  } catch {
+    return null
   }
 }
 
@@ -515,17 +831,41 @@ function buildStageViewModels(
   completionByStage: Map<string, string>,
   taskDetailByStage: Map<string, TaskDetail>,
   visitedStages: Set<string>,
+  groupPath: Set<string> | null,
 ): StageViewModel[] {
+  // Whether we have any task history to trust. With no history (e.g. a migrated
+  // legacy record) we show the full canonical path and never hide stages as
+  // "skipped" — we don't try to reconstruct what actually happened.
+  const hasTaskHistory = visitedStages.size > 0
+  // Highest sequence the record has actually reached. When the current stage is
+  // earlier than this, the record was returned to an earlier point in the path.
+  const maxVisitedSequence = stages.reduce(
+    (max, stage) =>
+      visitedStages.has(stage.id.toLowerCase())
+        ? Math.max(max, stage.sequenceNumber)
+        : max,
+    0,
+  )
+
   return stages
     .map((stage) => {
-      const status =
+      const baseStatus =
         currentSequence === null
           ? 'upcoming'
           : getStageStatus(stage.sequenceNumber, currentSequence)
 
+      // Flag the active stage as "returned" when the record previously advanced
+      // past it and was sent back here.
+      const status: StageStatus =
+        baseStatus === 'inProgress' &&
+        currentSequence !== null &&
+        currentSequence < maxVisitedSequence
+          ? 'returned'
+          : baseStatus
+
       const key = stage.id.toLowerCase()
       const taskDetail =
-        status === 'completed' || status === 'inProgress'
+        status === 'completed' || status === 'inProgress' || status === 'returned'
           ? taskDetailByStage.get(key)
           : undefined
 
@@ -535,20 +875,50 @@ function buildStageViewModels(
         isCurrent: stage.sequenceNumber === currentSequence,
         completedOn:
           status === 'completed'
-            ? formatCompletedDate(completionByStage.get(key))
+            ? formatDate(completionByStage.get(key))
             : undefined,
         taskId: taskDetail?.taskId,
         comment: taskDetail?.comment,
         ownerName: taskDetail?.ownerName,
         ownerId: taskDetail?.ownerId,
         ownerEntityType: taskDetail?.ownerEntityType,
+        dueDate: taskDetail?.dueDate,
       }
     })
-    .filter(
-      (stage) =>
-        stage.status !== 'completed' ||
-        visitedStages.has(stage.id.toLowerCase()),
-    )
+    .filter((stage) => {
+      const visited = visitedStages.has(stage.id.toLowerCase())
+      const inGroupPath = groupPath
+        ? groupPath.has(stage.stageName.toLowerCase())
+        : null
+
+      // Restrict to the record's group path. Stages outside it are shown only
+      // when the record actually visited them (e.g. a Comment Reconciliation
+      // detour) or is currently on them. When the group is unknown (inGroupPath
+      // null) fall back to the off-path name rules below.
+      if (inGroupPath === false && !visited && !stage.isCurrent) {
+        return false
+      }
+
+      // Hide optional/path stages the record skipped: completed by sequence but
+      // never actually landed on (e.g. BAO Approval skipped by the Center
+      // Approver). Only applies when we have task history to trust.
+      if (hasTaskHistory && stage.status === 'completed' && !visited) {
+        return false
+      }
+
+      // Fallback when the group is unknown: hide off-path stages (comment
+      // reconciliation / address comments) unless visited or current.
+      if (
+        inGroupPath === null &&
+        isOffPathStage(stage.stageName) &&
+        !visited &&
+        !stage.isCurrent
+      ) {
+        return false
+      }
+
+      return true
+    })
 }
 
 function navigateToRecord(entityName: string, entityId: string) {
@@ -646,6 +1016,7 @@ function App() {
     () => new Map(),
   )
   const [visitedStages, setVisitedStages] = useState<Set<string>>(() => new Set())
+  const [groupPath, setGroupPath] = useState<Set<string> | null>(null)
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(() => new Set())
   const [formContext] = useState<FormContext | undefined>(() => getFormContext())
 
@@ -661,73 +1032,101 @@ function App() {
     })
   }, [])
 
+  const mountedRef = useRef(true)
   useEffect(() => {
-    let active = true
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
-    async function loadStages() {
-      try {
-        setLoadState('loading')
-        setSourceLabel('Loading workflow stages.')
+  // Fetches the record's workflow, stages, and task history and updates state.
+  // `silent` suppresses the "no workflow"/error states on background refreshes
+  // so a transient failure leaves the existing data on screen. The first load
+  // shows the loading state via the initial loadState/sourceLabel values.
+  const loadStages = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = options?.silent ?? false
 
-        const [{ stageId, workflowId }, taskHistory] = await Promise.all([
-          fetchRecordWorkflow(),
-          fetchTaskHistory(),
-        ])
+    try {
+      const [{ stageId, workflowId, groupPath: nextGroupPath }, taskHistory] =
+        await Promise.all([fetchRecordWorkflow(), fetchTaskHistory()])
 
-        if (!active) {
-          return
-        }
+      if (!mountedRef.current) {
+        return
+      }
 
-        if (!workflowId) {
+      if (!workflowId) {
+        if (!silent) {
           setSourceLabel(
             'No workflow is associated with this record. Set the workflow stage to visualize the workflow.',
           )
           setLoadState('error')
-          return
         }
-
-        setCurrentWorkflowId(workflowId)
-
-        const { rows: nextRows, source } = await fetchWorkflowStages(workflowId)
-
-        if (!active) {
-          return
-        }
-
-        const currentRow = stageId
-          ? nextRows.find(
-              (row) =>
-                row.usgs_workflowstageid?.toLowerCase() === stageId.toLowerCase(),
-            )
-          : undefined
-
-        setRows(nextRows)
-        setCurrentSequence(currentRow?.usgs_sequencenumber ?? null)
-        setCompletionByStage(taskHistory.completionByStage)
-        setTaskDetailByStage(taskHistory.taskDetailByStage)
-        setVisitedStages(taskHistory.visitedStages)
-        setSourceLabel(source)
-        setLoadState('ready')
-      } catch (error) {
-        if (!active) {
-          return
-        }
-
-        setSourceLabel(
-          error instanceof Error
-            ? error.message
-            : 'Dataverse did not return workflow stages.',
-        )
-        setLoadState('error')
+        return
       }
-    }
 
-    loadStages()
+      setCurrentWorkflowId(workflowId)
 
-    return () => {
-      active = false
+      const { rows: nextRows, source } = await fetchWorkflowStages(workflowId)
+
+      if (!mountedRef.current) {
+        return
+      }
+
+      const currentRow = stageId
+        ? nextRows.find(
+            (row) =>
+              row.usgs_workflowstageid?.toLowerCase() === stageId.toLowerCase(),
+          )
+        : undefined
+
+      setRows(nextRows)
+      setCurrentSequence(currentRow?.usgs_sequencenumber ?? null)
+      setCompletionByStage(taskHistory.completionByStage)
+      setTaskDetailByStage(taskHistory.taskDetailByStage)
+      setVisitedStages(taskHistory.visitedStages)
+      setGroupPath(nextGroupPath ?? null)
+      setSourceLabel(source)
+      setLoadState('ready')
+    } catch (error) {
+      if (!mountedRef.current || silent) {
+        return
+      }
+
+      setSourceLabel(
+        error instanceof Error
+          ? error.message
+          : 'Dataverse did not return workflow stages.',
+      )
+      setLoadState('error')
     }
   }, [])
+
+  // Initial load. The state updates happen asynchronously after the Dataverse
+  // fetch resolves, not synchronously in the effect body, so the cascading-render
+  // concern the rule guards against does not apply here.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async data fetch on mount
+    void loadStages()
+  }, [loadStages])
+
+  // Keep the visualizer current after task updates: re-fetch on a fixed interval
+  // and whenever the host form calls window.refreshWorkflowVisualizer() (e.g.
+  // from a task subgrid's OnSave). Both run silently to avoid UI flicker.
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadStages({ silent: true })
+    }, REFRESH_INTERVAL_MS)
+
+    window.refreshWorkflowVisualizer = () => {
+      void loadStages({ silent: true })
+    }
+
+    return () => {
+      window.clearInterval(intervalId)
+      delete window.refreshWorkflowVisualizer
+    }
+  }, [loadStages])
 
   // The side pane has no "form close" event, so poll the app's main area every
   // 5 seconds. The pane stays only while a usgs_informationproduct *record form*
@@ -751,8 +1150,9 @@ function App() {
         completionByStage,
         taskDetailByStage,
         visitedStages,
+        groupPath,
       ),
-    [stages, currentSequence, completionByStage, taskDetailByStage, visitedStages],
+    [stages, currentSequence, completionByStage, taskDetailByStage, visitedStages, groupPath],
   )
 
   const currentStage = stages.find((stage) => stage.sequenceNumber === currentSequence)
@@ -808,6 +1208,7 @@ function App() {
                 !!stage.description ||
                 !!stage.comment ||
                 !!stage.ownerName ||
+                !!stage.dueDate ||
                 !!stage.taskId
 
               return (
@@ -822,17 +1223,11 @@ function App() {
                     <StatusIcon status={stage.status} />
                   </div>
                   <div className="stepContent">
-                    <div
+                    <button
+                      type="button"
                       className="stepHeader"
                       onClick={() => toggleStage(stage.id)}
-                      tabIndex={0}
                       aria-expanded={isExpanded}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          toggleStage(stage.id)
-                        }
-                      }}
                     >
                       <div className="stepHeaderMain">
                         <div className="stageTitleRow">
@@ -849,7 +1244,7 @@ function App() {
                         )}
                       </div>
                       {hasDetails && <ChevronIcon expanded={isExpanded} />}
-                    </div>
+                    </button>
 
                     {isExpanded && hasDetails && (
                       <div className="stageDetails">
@@ -876,6 +1271,11 @@ function App() {
                                 ) : (
                                   <span>{stage.ownerName}</span>
                                 )}
+                              </span>
+                            )}
+                            {stage.dueDate && (
+                              <span className="detailDueLine">
+                                Due {stage.dueDate}
                               </span>
                             )}
                             {stage.comment && (
