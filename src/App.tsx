@@ -153,138 +153,114 @@ const TASK_DUE_DATE_FIELD = 'usgs_requestedduedatefornexttask'
 const REFRESH_INTERVAL_MS = 30000
 
 // ---------------------------------------------------------------------------
-// Stage visibility model.
+// Workflow group model.
 //
-// Which stages a record displays is driven by the BPF helper fields on the
-// Information Product (peer-review / BAO / SPN / accepted-manuscript "skipped"
-// flags) plus the live current BPF stage — NOT by a hardcoded workflow-group
-// number. Each canonical stage belongs to one or more "chunks"; a chunk is shown
-// or hidden as a unit based on the helper flags, so the visualizer renders only
-// the path that actually applies to this record.
+// The IPDS workflow is a single shared catalog of stages (usgs_workflowstage);
+// which of those stages a given Information Product actually travels through is
+// determined by its "workflow group" (1–7). The group is derived in code from
+// the IP's product type plus a few routing conditions (determineGroup), and each
+// group maps to a fixed, ordered list of stages to DISPLAY (GROUP_PATHS).
+//
+// The seven stage lists below are taken verbatim from the user-story acceptance
+// criteria / the IPDS workflow configuration spreadsheet. Stage names must match
+// usgs_workflowstage.usgs_name (compared case-insensitively) for a stage to
+// render — a name in a path that has no matching stage row is simply skipped.
 //
 // Comment-reconciliation ("<Approval> - Address Comments") stages are NOT part
-// of the canonical path. They are exception stages shown only when the record's
-// current active stage is exactly that reconciliation stage.
+// of any group path. They are exception stages shown only when the record has
+// actually been routed through them (visited or current).
 // ---------------------------------------------------------------------------
 
-// A chunk groups stages that are shown/hidden together. 'core' stages always
-// show (except the direct-dissemination exception); the rest are gated by the
-// BPF helper flags — see computeVisibility / isChunkVisible.
-type StageChunk =
-  | 'core'
-  | 'peerReview'
-  | 'spnEdit'
-  | 'spnProduction'
-  | 'bao'
-  | 'acceptedManuscript'
-
-// The full, ordered superset of non-reconciliation stages, in display order.
-// Stage names must match usgs_workflowstage.usgs_name (compared
-// case-insensitively). A stage shows when ANY of its chunks is visible (or it is
-// 'core', or the record visited it / is currently on it). "SPN Production" is
-// shared: it is the production step for both USGS-publication records
-// (spnProduction chunk) and journal accepted-manuscript records
-// (acceptedManuscript chunk), so it carries both chunks. The environment has no
-// distinct "SPN Production of Accepted Manuscript" stage, so journals use this
-// shared "SPN Production" as their accepted-manuscript production step.
-const CANONICAL_PATH: { name: string; chunks: StageChunk[] }[] = [
-  { name: 'Prepare Record', chunks: ['core'] },
-  { name: 'Approve for Peer Review', chunks: ['peerReview'] },
-  { name: 'Peer Review and Reconciliation', chunks: ['peerReview'] },
-  { name: 'Approve for SPN Edit', chunks: ['spnEdit'] },
-  { name: 'Prepare for SPN Edit', chunks: ['spnEdit'] },
-  { name: 'Initial SPN Edit', chunks: ['spnEdit'] },
-  { name: 'Response to SPN Edit', chunks: ['spnEdit'] },
-  { name: 'SPN Edit Approval', chunks: ['spnEdit'] },
-  { name: 'Supervisory Approval', chunks: ['core'] },
-  { name: 'Center Approval', chunks: ['core'] },
-  { name: 'BAO Approval', chunks: ['bao'] },
-  { name: 'Upload accepted manuscript', chunks: ['acceptedManuscript'] },
-  { name: 'Prepare for SPN Production', chunks: ['spnProduction'] },
-  { name: 'SPN Production', chunks: ['spnProduction', 'acceptedManuscript'] },
-  { name: 'Response to SPN Author Proof', chunks: ['spnProduction'] },
-  { name: 'Web Citation Page', chunks: ['spnProduction'] },
-  { name: 'Response to Web Citation Page', chunks: ['spnProduction'] },
-  { name: 'Dissemination', chunks: ['core'] },
-  { name: 'Disseminated', chunks: ['core'] },
-]
-
-// Core stages an extramural / direct-dissemination record still shows. For that
-// path the approval stages (Supervisory, Center) are skipped entirely.
-const DIRECT_DISSEMINATION_STAGES = new Set<string>([
-  'prepare record',
-  'dissemination',
-  'disseminated',
-])
-
-// Resolved stage visibility for a single record, computed from the BPF helper
-// fields plus the product type (for the SPN-type gate and the extramural
-// direct-dissemination exception).
-type StageVisibility = {
-  showPeerReview: boolean
-  showBaoApproval: boolean
-  showSpnStages: boolean
-  showAcceptedManuscript: boolean
-  directDisseminationOnly: boolean
+const GROUP_PATHS: Record<number, string[]> = {
+  1: [
+    'Prepare Record',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Dissemination',
+  ],
+  2: [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Supervisory Approval',
+    'Center Approval',
+    'Dissemination',
+  ],
+  3: [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Dissemination',
+  ],
+  4: [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Upload Accepted Manuscript',
+    'SPN Production of Accepted Manuscript',
+    'Dissemination',
+  ],
+  5: ['Prepare Record', 'Dissemination'],
+  6: [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Approve for SPN Edit',
+    'Prepare for SPN Edit',
+    'Initial SPN Edit',
+    'Response to SPN Edit',
+    'SPN Edit Approval',
+    'Supervisory Approval',
+    'Center Approval',
+    'Prepare for SPN Production',
+    'SPN Production',
+    'Response to SPN Author Proof',
+    'Web Citation Page',
+    'Response to Web Citation Page',
+    'Dissemination',
+  ],
+  7: [
+    'Prepare Record',
+    'Approve for Peer Review',
+    'Peer Review and Reconciliation',
+    'Approve for SPN Edit',
+    'Prepare for SPN Edit',
+    'Initial SPN Edit',
+    'Response to SPN Edit',
+    'SPN Edit Approval',
+    'Supervisory Approval',
+    'Center Approval',
+    'BAO Approval',
+    'Prepare for SPN Production',
+    'SPN Production',
+    'Response to SPN Author Proof',
+    'Web Citation Page',
+    'Response to Web Citation Page',
+    'Dissemination',
+  ],
 }
 
-// True when the given chunk should be shown for a record with this visibility.
-function isChunkVisible(chunk: StageChunk, visibility: StageVisibility): boolean {
-  switch (chunk) {
-    case 'core':
-      return true
-    case 'peerReview':
-      return visibility.showPeerReview
-    case 'spnEdit':
-    case 'spnProduction':
-      // One helper (usgs_bpfhelperspnskipped) governs BOTH SPN chunks together.
-      return visibility.showSpnStages
-    case 'bao':
-      return visibility.showBaoApproval
-    case 'acceptedManuscript':
-      return visibility.showAcceptedManuscript
-  }
-}
-
-// Extracts the parent approval-stage name from a comment-reconciliation stage
-// name following the "<Approval Stage> - Address Comment(s)" convention, or null
-// if the name isn't a comment-reconciliation stage. Used to position the
-// reconciliation stage immediately after its related approval stage.
-function addressCommentsParent(stageName: string): string | null {
-  const match = stageName.match(/^(.*?)\s*-\s*address comments?$/i)
-  return match ? match[1].trim() : null
-}
-
-// --- Field bindings --------------------------------------------------------
-// Besides the BPF helper booleans, the only IP column the visibility logic needs
-// is the product type — read from its lookup's formatted value. Visibility is
-// driven entirely by the BPF helper fields (NOT by routing the record into a
-// workflow group), so the old interpretive-content / special-alert / publication-
-// outlet / open-access routing inputs are no longer read.
-const PRODUCT_TYPE_FIELD = '_usgs_producttype_value'
-
-// BPF helper (boolean) columns — the source of truth for which optional stage
-// chunks apply to a record. Set by the IPDS Business Process Flow. Meaning of a
-// `true` value:
-//   peerReviewSkipped           -> hide the Peer Review stages
-//   baoApprovalSkipped          -> hide the BAO Approval stage
-//   spnSkipped                  -> hide BOTH SPN Edit and SPN Production stages
-//   notOpenAccessJournalArticle -> SHOW the accepted-manuscript stages
-// (usgs_bpfhelperproducttypename is intentionally NOT used for routing — the
-// product type is read from the _usgs_producttype_value lookup instead.)
-const BPF_HELPER_FIELDS = {
-  peerReviewSkipped: 'usgs_bpfhelperpeerreviewskipped',
-  baoApprovalSkipped: 'usgs_bpfhelperbaoapprovalskipped',
-  spnSkipped: 'usgs_bpfhelperspnskipped',
-  notOpenAccessJournalArticle: 'usgs_bpfhelpernotopenaccessjournalarticle',
+// --- IP routing field bindings ---------------------------------------------
+// The columns read from the Information Product to derive its workflow group.
+// Peer-review-required is intentionally NOT read: routing is driven by product
+// type + escalation (new interpretive content or a Special Product Alert) +
+// open-access / outlet, per the IPDS routing rules.
+const IP_ROUTING_FIELDS = {
+  productType: '_usgs_producttype_value',
+  interpretiveContent: 'usgs_interpretivecontent',
+  specialProductAlert: 'usgs_specialproductalert',
+  publicationOutletType: 'usgs_publicationoutlettype',
+  openAccess: 'usgs_openaccess',
 } as const
 
-// Columns read to compute stage visibility: the product type plus the BPF helper
-// booleans.
-const VISIBILITY_SELECT = [
-  PRODUCT_TYPE_FIELD,
-  ...Object.values(BPF_HELPER_FIELDS),
-].join(',')
+const IP_ROUTING_SELECT = Object.values(IP_ROUTING_FIELDS).join(',')
 
 // Reads an option-set/lookup column as its display label when available, falling
 // back to the raw stored value.
@@ -292,6 +268,22 @@ function readLabel(record: Record<string, unknown>, logicalName: string): string
   const formatted =
     record[`${logicalName}@OData.Community.Display.V1.FormattedValue`]
   return String(formatted ?? record[logicalName] ?? '')
+}
+
+// Reads an option-set column as its raw numeric value (null when absent).
+function readOptionSetValue(
+  record: Record<string, unknown>,
+  logicalName: string,
+): number | null {
+  const value = record[logicalName]
+  if (typeof value === 'number') {
+    return value
+  }
+  if (value === null || value === undefined || value === '') {
+    return null
+  }
+  const numeric = Number(value)
+  return Number.isNaN(numeric) ? null : numeric
 }
 
 function isTruthy(value: unknown): boolean {
@@ -303,57 +295,168 @@ function isTruthy(value: unknown): boolean {
   )
 }
 
-// --- Product-type gates ----------------------------------------------------
-// Only two stage groups depend on the product type rather than purely on a BPF
-// helper flag. Both are matched against the product type lookup's FORMATTED
-// VALUE (not a workflow-group number). Compare case-insensitively; update these
-// lists if the product-type labels in the environment change.
-
-// Product types whose records can use the SPN Edit + SPN Production stages. The
-// SPN stages still require usgs_bpfhelperspnskipped to be not-true; this gate
-// just confirms the product type is a USGS series / nonseries publication.
-const SPN_PRODUCT_TYPES = new Set<string>([
-  'usgs series publication',
-  'nonseries usgs publications',
-  'circular',
-])
-
-function isSpnProductType(productTypeLabel: string): boolean {
-  return SPN_PRODUCT_TYPES.has(productTypeLabel.trim().toLowerCase())
+// Extracts the parent approval-stage name from a comment-reconciliation stage
+// name following the "<Approval Stage> - Address Comment(s)" convention, or null
+// if the name isn't a comment-reconciliation stage. Used to position the
+// reconciliation stage immediately after its related approval stage.
+function addressCommentsParent(stageName: string): string | null {
+  const match = stageName.match(/^(.*?)\s*-\s*address comments?$/i)
+  return match ? match[1].trim() : null
 }
 
-// Product types that disseminate directly, skipping the approval stages. This is
-// the one confirmed direct-dissemination-only exception to "always show the core
-// approval stages" (extramural-authored publications).
-const DIRECT_DISSEMINATION_PRODUCT_TYPES = new Set<string>([
-  'extramural-authored publication',
-])
-
-function isDirectDisseminationProductType(productTypeLabel: string): boolean {
-  return DIRECT_DISSEMINATION_PRODUCT_TYPES.has(
-    productTypeLabel.trim().toLowerCase(),
-  )
+// --- Group routing ---------------------------------------------------------
+// The routing inputs read off the IP record and normalized for determineGroup.
+type WorkflowInputs = {
+  productTypeLabel: string
+  // usgs_interpretivecontent: 1 = New interpretive (escalation trigger),
+  // 2 = previously approved, 3 = noninterpretive.
+  interpretiveContent: number | null
+  // usgs_specialproductalert: 0 = None; any non-zero = an alert is present
+  // (escalation trigger).
+  specialProductAlert: number | null
+  // usgs_publicationoutlettype: 1 = Science outlet, 2 = Non-scientific news media.
+  publicationOutletType: number | null
+  openAccess: boolean
 }
 
-// Computes stage visibility purely from the BPF helper booleans + product type.
-// This is the SOLE source of truth for which optional stage chunks a record
-// shows — there is NO workflow-group routing. Helper semantics: a "skipped" flag
-// of true HIDES its stages; the not-open-access-journal-article flag of true
-// SHOWS the accepted-manuscript stages. The SPN stages additionally require a
-// USGS series / nonseries publication product type.
-function computeVisibility(record: Record<string, unknown>): StageVisibility {
-  const productTypeLabel = readLabel(record, PRODUCT_TYPE_FIELD)
-
+function readWorkflowInputs(record: Record<string, unknown>): WorkflowInputs {
   return {
-    showPeerReview: !isTruthy(record[BPF_HELPER_FIELDS.peerReviewSkipped]),
-    showBaoApproval: !isTruthy(record[BPF_HELPER_FIELDS.baoApprovalSkipped]),
-    showSpnStages:
-      !isTruthy(record[BPF_HELPER_FIELDS.spnSkipped]) &&
-      isSpnProductType(productTypeLabel),
-    showAcceptedManuscript: isTruthy(
-      record[BPF_HELPER_FIELDS.notOpenAccessJournalArticle],
+    productTypeLabel: readLabel(record, IP_ROUTING_FIELDS.productType),
+    interpretiveContent: readOptionSetValue(
+      record,
+      IP_ROUTING_FIELDS.interpretiveContent,
     ),
-    directDisseminationOnly: isDirectDisseminationProductType(productTypeLabel),
+    specialProductAlert: readOptionSetValue(
+      record,
+      IP_ROUTING_FIELDS.specialProductAlert,
+    ),
+    publicationOutletType: readOptionSetValue(
+      record,
+      IP_ROUTING_FIELDS.publicationOutletType,
+    ),
+    openAccess: isTruthy(record[IP_ROUTING_FIELDS.openAccess]),
+  }
+}
+
+// Broad product-type buckets used by determineGroup. A single product type maps
+// to exactly one category; the routing conditions (escalation, open access,
+// outlet) then select the group within that category.
+type ProductCategory =
+  | 'simple' // low-content types: default Group 1
+  | 'standardPublication' // Atlas / Book / Map(non-USGS) / Thesis / etc.
+  | 'newsMedia' // news / media outlet types
+  | 'dataSoftware' // data / software / online resource: always Group 2
+  | 'journal' // Journal or periodical article
+  | 'usgsPublication' // USGS series / nonseries / Circular
+  | 'extramural' // Extramural-authored: Group 5
+  | 'alwaysBao' // Book review / Technical comment & reply / Preprint: Group 3
+
+// Exact product-type labels (lowercased) per category. Update these lists to
+// match the product-type option labels in the environment / IPDS spreadsheet.
+const PRODUCT_CATEGORY_LABELS: [ProductCategory, string[]][] = [
+  ['extramural', ['extramural-authored publication']],
+  [
+    'usgsPublication',
+    [
+      'usgs series publication',
+      'nonseries usgs publications',
+      'nonseries usgs publication',
+      'circular',
+    ],
+  ],
+  ['journal', ['journal or periodical article', 'journal article']],
+  ['alwaysBao', ['book review', 'technical comment and reply', 'preprint']],
+  [
+    'simple',
+    [
+      'abstract or summary',
+      'abstract/summary',
+      'poster or presentation',
+      'poster/presentation',
+      'usgs web page',
+    ],
+  ],
+  [
+    'dataSoftware',
+    [
+      'data release',
+      'software release',
+      'geonarrative',
+      'usgs-owned online database',
+      'usgs-owned online db',
+      'web data service',
+    ],
+  ],
+  [
+    'newsMedia',
+    ['news release', 'media interview', 'news/media', 'news or media'],
+  ],
+  [
+    'standardPublication',
+    [
+      'atlas',
+      'book',
+      'book chapter',
+      'map',
+      'thesis',
+      'dissertation',
+      'conference paper',
+      'pamphlet',
+      'professional paper',
+    ],
+  ],
+]
+
+function categorizeProductType(productTypeLabel: string): ProductCategory | null {
+  const label = productTypeLabel.trim().toLowerCase()
+  if (!label) {
+    return null
+  }
+  for (const [category, labels] of PRODUCT_CATEGORY_LABELS) {
+    if (labels.includes(label)) {
+      return category
+    }
+  }
+  return null
+}
+
+// Derives the workflow group (1–7) for an IP from its routing inputs, or null
+// when the product type can't be classified (unknown / unmapped types). The
+// caller renders GROUP_PATHS[group]; a null group falls back to showing only the
+// stages the record actually visited (no guessing).
+//
+// Escalation = new interpretive content OR any Special Product Alert; escalation
+// promotes a record to a group that includes BAO / additional review.
+function determineGroup(inputs: WorkflowInputs): number | null {
+  const category = categorizeProductType(inputs.productTypeLabel)
+  const escalated =
+    inputs.interpretiveContent === 1 ||
+    (inputs.specialProductAlert !== null && inputs.specialProductAlert !== 0)
+
+  switch (category) {
+    case 'extramural':
+      return 5
+    case 'usgsPublication':
+      return escalated ? 7 : 6
+    case 'journal':
+      // Open-access journal article → Group 3; not-open-access → Group 4.
+      return inputs.openAccess ? 3 : 4
+    case 'alwaysBao':
+      return 3
+    case 'simple':
+      // Low-content types default to Group 1 (peer review ignored in routing).
+      return 1
+    case 'dataSoftware':
+      // Data / software / online resources always route to Group 2.
+      return 2
+    case 'standardPublication':
+      // Standard publications: escalated → Group 3 (BAO), else Group 2.
+      return escalated ? 3 : 2
+    case 'newsMedia':
+      // News/media: escalated or scientific outlet → Group 3, else Group 1.
+      return escalated || inputs.publicationOutletType === 1 ? 3 : 1
+    default:
+      return null
   }
 }
 
@@ -722,7 +825,8 @@ function asGuid(value: unknown): string | undefined {
 async function fetchRecordWorkflow(): Promise<{
   stageId?: string
   workflowId?: string
-  visibility?: StageVisibility | null
+  groupNumber?: number | null
+  groupPath?: string[] | null
   isLegacy?: boolean
 }> {
   const xrm = getXrmContext()
@@ -758,57 +862,58 @@ async function fetchRecordWorkflow(): Promise<{
       }
     }
 
-    const visibility = await fetchVisibility(xrm, formContext)
+    const { groupNumber, groupPath } = await fetchGroupPath(xrm, formContext)
 
-    return { stageId, workflowId, visibility, isLegacy }
+    return { stageId, workflowId, groupNumber, groupPath, isLegacy }
   } catch {
     return {}
   }
 }
 
-// Reads the IP record's BPF helper fields + product type and computes stage
-// visibility. Kept in a separate, independently-guarded request so that a bad
-// field binding only disables filtering — the stage list still renders. Returns
-// null on failure, which drives the strict fallback in buildStageViewModels.
-async function fetchVisibility(
+// Reads the IP record's routing fields and derives its workflow group + the
+// ordered stage path to display. Kept in a separate, independently-guarded
+// request so that a bad field binding only disables path selection — the stage
+// list still renders. Returns nulls on failure / unknown product type, which
+// drives the "visited only" fallback in buildOrderedDisplay.
+async function fetchGroupPath(
   xrm: XrmContext,
   formContext: FormContext,
-): Promise<StageVisibility | null> {
+): Promise<{ groupNumber: number | null; groupPath: string[] | null }> {
   try {
     const record = await xrm.WebApi.retrieveRecord(
       formContext.entityName,
       formContext.recordId,
-      `?$select=${VISIBILITY_SELECT}`,
+      `?$select=${IP_ROUTING_SELECT}`,
     )
 
-    // --- Visibility diagnostics -----------------------------------------------
-    // Logs every object the visibility pipeline consumes/produces so the show/
-    // hide decisions can be traced in the browser console. One collapsible entry.
-    console.groupCollapsed('[WorkflowVisualizer] visibility')
+    const inputs = readWorkflowInputs(record)
+    const groupNumber = determineGroup(inputs)
+    const groupPath = groupNumber ? GROUP_PATHS[groupNumber] ?? null : null
+
+    // --- Routing diagnostics --------------------------------------------------
+    // Logs every object the routing pipeline consumes/produces so the group
+    // decision can be traced in the browser console. One collapsible entry.
+    console.groupCollapsed('[WorkflowVisualizer] group routing')
     console.log('formContext', formContext)
-    console.log('visibility fields ($select)', VISIBILITY_SELECT.split(','))
-    // The product type + BPF helper columns off the raw IP record, including the
-    // formatted (label) annotations Dataverse returns alongside the raw values.
+    console.log('routing fields ($select)', IP_ROUTING_SELECT.split(','))
     const rawFields: Record<string, unknown> = {}
-    for (const logicalName of [PRODUCT_TYPE_FIELD, ...Object.values(BPF_HELPER_FIELDS)]) {
+    for (const logicalName of Object.values(IP_ROUTING_FIELDS)) {
       rawFields[logicalName] = record[logicalName]
       const formattedKey = `${logicalName}@OData.Community.Display.V1.FormattedValue`
       if (formattedKey in record) {
         rawFields[formattedKey] = record[formattedKey]
       }
     }
-    console.log('raw product type + BPF helper fields off record', rawFields)
-    console.log('full record', record)
-    console.log('product type (formatted value)', readLabel(record, PRODUCT_TYPE_FIELD))
-
-    const visibility = computeVisibility(record)
-    console.log('computed visibility', visibility)
+    console.log('raw routing fields off record', rawFields)
+    console.log('normalized inputs', inputs)
+    console.log('resolved group', groupNumber)
+    console.log('group path', groupPath)
     console.groupEnd()
 
-    return visibility
+    return { groupNumber, groupPath }
   } catch (error) {
-    console.warn('[WorkflowVisualizer] visibility computation failed', error)
-    return null
+    console.warn('[WorkflowVisualizer] group routing failed', error)
+    return { groupNumber: null, groupPath: null }
   }
 }
 
@@ -831,8 +936,7 @@ function normalizeWorkflowStages(rows: DataverseWorkflowStageRow[]): WorkflowSta
 // Inserts a stage into an already-ordered list at the position implied by its
 // global sequence number (before the first stage with a greater sequence). Used
 // for off-path stages that DON'T follow the "Address Comments" naming convention
-// (e.g. an optional BAO Approval the record was routed to) — their global
-// sequence sits correctly between the surrounding approval stages.
+// — their global sequence sits correctly between the surrounding stages.
 function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): void {
   let insertAt = placed.length
   for (let i = 0; i < placed.length; i++) {
@@ -844,19 +948,18 @@ function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): 
   placed.splice(insertAt, 0, stage)
 }
 
-// Builds the ordered list of stages to DISPLAY for a record. Walks the canonical
-// path in order and includes a stage when ANY of its chunks is visible per the
-// BPF helper flags, OR the record actually landed on it (visited / current) — so
-// completed stages always stay visible even if their chunk would otherwise be
-// hidden. Comment-reconciliation ("<Approval> - Address Comments") stages are NOT
-// in the canonical path: each is shown ONLY if the record actually landed on it
-// (the specific approver's reconciliation stage), grafted in immediately after
-// its parent approval stage; reconciliation stages the record never reached stay
-// hidden. Extramural / direct-dissemination records show only the direct path
-// (Prepare Record -> Dissemination -> Disseminated), skipping the approvals.
-function buildHelperDrivenDisplay(
+// Builds the ordered list of stages to DISPLAY for a record. Places the stages
+// named in the record's workflow-group path in order (each stage at most once,
+// so a stage the record revisited still appears only once). Then grafts in the
+// off-path stages the record actually landed on (visited / current) — primarily
+// comment-reconciliation ("<Approval> - Address Comments") stages, which are NOT
+// part of any group path and appear ONLY when the record was routed through
+// them, positioned immediately after their parent approval stage. When the group
+// can't be determined (groupPath null), nothing is pre-placed and only the
+// visited/current stages show — the visualizer never guesses a path.
+function buildOrderedDisplay(
   stages: WorkflowStage[],
-  visibility: StageVisibility,
+  groupPath: string[] | null,
   currentStage: WorkflowStage | undefined,
   visited: (stage: WorkflowStage) => boolean,
 ): WorkflowStage[] {
@@ -872,41 +975,26 @@ function buildHelperDrivenDisplay(
   const placed: WorkflowStage[] = []
   const placedIds = new Set<string>()
 
-  // Walk the canonical path in order; include each stage whose chunk applies or
-  // that the record actually landed on (so completed stages stay visible).
-  for (const entry of CANONICAL_PATH) {
-    const nameLower = entry.name.toLowerCase()
-    const stage = byName.get(nameLower)
-    if (!stage || placedIds.has(stage.id)) {
-      continue
-    }
-
-    const landedOn = nameLower === currentNameLower || visited(stage)
-
-    // Direct-dissemination (extramural) records skip the approval stages unless
-    // the record actually landed on one.
-    if (
-      visibility.directDisseminationOnly &&
-      !DIRECT_DISSEMINATION_STAGES.has(nameLower) &&
-      !landedOn
-    ) {
-      continue
-    }
-
-    const chunkVisible = entry.chunks.some((chunk) => isChunkVisible(chunk, visibility))
-    if (chunkVisible || landedOn) {
+  // 1. Place the group-path stages in their defined order (deduped by id, so a
+  //    revisited stage still shows once).
+  if (groupPath) {
+    for (const name of groupPath) {
+      const stage = byName.get(name.toLowerCase())
+      if (!stage || placedIds.has(stage.id)) {
+        continue
+      }
       placed.push(stage)
       placedIds.add(stage.id)
     }
   }
 
-  // Graft in the off-path stages the record actually landed on (visited or
-  // current) — primarily comment-reconciliation stages. Only the specific
-  // reconciliation stage(s) the record reached appear; the rest stay hidden.
-  // Each reconciliation stage is placed immediately after its parent approval
-  // stage (its global sequence is unreliable); any other off-path stage is
-  // positioned by global sequence. Sorted by sequence so multiple extras keep a
-  // stable order.
+  // 2. Graft in the off-path stages the record actually landed on (visited or
+  //    current) — primarily comment-reconciliation stages. Only the specific
+  //    stage(s) the record reached appear; the rest stay hidden. Each
+  //    reconciliation stage is placed immediately after its parent approval
+  //    stage (its global sequence is unreliable); any other off-path stage is
+  //    positioned by global sequence. Sorted by sequence so multiple extras keep
+  //    a stable order.
   const offPathLanded = stages
     .filter(
       (stage) =>
@@ -954,7 +1042,7 @@ function buildStageViewModels(
   completionByStage: Map<string, string>,
   taskDetailByStage: Map<string, TaskDetail>,
   visitedStages: Set<string>,
-  visibility: StageVisibility | null,
+  groupPath: string[] | null,
   isLegacy: boolean,
 ): StageViewModel[] {
   const visited = (stage: WorkflowStage) => visitedStages.has(stage.id.toLowerCase())
@@ -966,30 +1054,14 @@ function buildStageViewModels(
   console.log('input: currentSequence', currentSequence)
   console.log('input: currentStage', currentStage?.stageName)
   console.log('input: visitedStages', [...visitedStages])
-  console.log('input: visibility', visibility)
+  console.log('input: groupPath', groupPath)
   console.log('input: isLegacy', isLegacy)
 
-  // Decide which stages to display, and in what order.
-  let display: WorkflowStage[]
-  if (visibility && !isLegacy) {
-    // Helper-driven: render only the chunks that apply to this record, in
-    // canonical order. The BPF helper flags are the source of truth, so stages
-    // that don't apply (e.g. "Upload accepted manuscript" on an abstract) are
-    // never shown — but stages the record actually landed on stay visible.
-    display = buildHelperDrivenDisplay(stages, visibility, currentStage, visited)
-  } else {
-    // Legacy record, or visibility couldn't be read: don't guess optional
-    // stages. Show the core stages plus whatever the record actually visited or
-    // is currently on — never the whole shared catalog.
-    const strict: StageVisibility = {
-      showPeerReview: false,
-      showBaoApproval: false,
-      showSpnStages: false,
-      showAcceptedManuscript: false,
-      directDisseminationOnly: false,
-    }
-    display = buildHelperDrivenDisplay(stages, strict, currentStage, visited)
-  }
+  // Decide which stages to display, and in what order: the record's workflow
+  // group path plus any reconciliation stages it was actually routed through.
+  // Legacy records use the same group path (per AC — show the standard path for
+  // the group; don't reconstruct missing history).
+  const display = buildOrderedDisplay(stages, groupPath, currentStage, visited)
 
   // Status is positional within the display list — NOT global sequence.
   const currentIndex = display.findIndex(isCurrent)
@@ -1008,7 +1080,9 @@ function buildStageViewModels(
     } else if (index === currentIndex) {
       // The record sits earlier than the furthest stage it reached => it was
       // sent back here => "returned" (needs attention). Otherwise in progress.
-      status = currentIndex < maxVisitedIndex ? 'returned' : 'inProgress'
+      // Legacy records skip this heuristic (visited history is unreliable).
+      status =
+        !isLegacy && currentIndex < maxVisitedIndex ? 'returned' : 'inProgress'
     } else {
       status = 'upcoming'
     }
@@ -1141,7 +1215,8 @@ function App() {
     () => new Map(),
   )
   const [visitedStages, setVisitedStages] = useState<Set<string>>(() => new Set())
-  const [visibility, setVisibility] = useState<StageVisibility | null>(null)
+  const [groupPath, setGroupPath] = useState<string[] | null>(null)
+  const [groupNumber, setGroupNumber] = useState<number | null>(null)
   const [isLegacy, setIsLegacy] = useState(false)
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(() => new Set())
   const [formContext] = useState<FormContext | undefined>(() => getFormContext())
@@ -1175,7 +1250,13 @@ function App() {
 
     try {
       const [
-        { stageId, workflowId, visibility: nextVisibility, isLegacy: nextIsLegacy },
+        {
+          stageId,
+          workflowId,
+          groupNumber: nextGroupNumber,
+          groupPath: nextGroupPath,
+          isLegacy: nextIsLegacy,
+        },
         taskHistory,
       ] = await Promise.all([fetchRecordWorkflow(), fetchTaskHistory()])
 
@@ -1213,7 +1294,8 @@ function App() {
       setCompletionByStage(taskHistory.completionByStage)
       setTaskDetailByStage(taskHistory.taskDetailByStage)
       setVisitedStages(taskHistory.visitedStages)
-      setVisibility(nextVisibility ?? null)
+      setGroupPath(nextGroupPath ?? null)
+      setGroupNumber(nextGroupNumber ?? null)
       setIsLegacy(nextIsLegacy ?? false)
       setSourceLabel(source)
       setLoadState('ready')
@@ -1279,10 +1361,10 @@ function App() {
         completionByStage,
         taskDetailByStage,
         visitedStages,
-        visibility,
+        groupPath,
         isLegacy,
       ),
-    [stages, currentSequence, completionByStage, taskDetailByStage, visitedStages, visibility, isLegacy],
+    [stages, currentSequence, completionByStage, taskDetailByStage, visitedStages, groupPath, isLegacy],
   )
 
   const currentStage = stages.find((stage) => stage.sequenceNumber === currentSequence)
@@ -1316,6 +1398,7 @@ function App() {
           </div>
           <div className="routeMeta" aria-label="Route details" hidden>
             <span>Current: {currentStage?.stage ?? 'Loading'}</span>
+            <span>{groupNumber ? `Group ${groupNumber}` : 'Group —'}</span>
           </div>
         </div>
 
