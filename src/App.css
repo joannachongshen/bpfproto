@@ -11,8 +11,9 @@
   --canvas: #ffffff;
   --line: #d1d1d1;
   --focus: #005ea8;
-  --complete: #00843d;
-  --complete-bg: #e7f4eb;
+  /* AC color scheme: completed stages = blue #0072B2 */
+  --complete: #0072b2;
+  --complete-bg: #e1eef7;
   --progress: #f6c700;
   --progress-bg: #fff8d7;
   --skipped: #71767a;
@@ -260,11 +261,11 @@
 }
 
 .step[data-status='inProgress']:hover .stepContent {
-  background-color: var(--progress-bg);
+  background-color: #e7f4fc;
 }
 
 .step[data-status='returned']:hover .stepContent {
-  background-color: var(--returned-bg);
+  background-color: var(--progress-bg);
 }
 
 .step[aria-current='step'] .stepContent {
@@ -500,16 +501,18 @@
 
 .step[data-status='completed'],
 .legendItem[data-status='completed'] {
+  /* Completed = blue #0072B2 */
   --status-color: var(--complete);
   --status-bg: var(--complete-bg);
-  --status-text: #154734;
+  --status-text: #00405f;
 }
 
 .step[data-status='inProgress'],
 .legendItem[data-status='inProgress'] {
-  --status-color: #8a6d00;
-  --status-bg: var(--progress-bg);
-  --status-text: #5c4700;
+  /* Current active = light blue #56B4E9 */
+  --status-color: #56b4e9;
+  --status-bg: #e7f4fc;
+  --status-text: #0b4c6b;
 }
 
 .step[data-status='skipped'],
@@ -521,16 +524,17 @@
 
 .step[data-status='returned'],
 .legendItem[data-status='returned'] {
-  --status-color: var(--returned);
-  --status-bg: var(--returned-bg);
-  --status-text: #7f0000;
+  --status-color: #9a7400;
+  --status-bg: var(--progress-bg);
+  --status-text: #5c4700;
 }
 
 .step[data-status='upcoming'],
 .legendItem[data-status='upcoming'] {
-  --status-color: #8a8886;
+  /* Future = gray #999999 */
+  --status-color: #999999;
   --status-bg: #ffffff;
-  --status-text: #3d3d3d;
+  --status-text: #5c5c5c;
 }
 
 .emptyState {

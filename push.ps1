@@ -1,0 +1,59 @@
+# 1. Build your project
+npm run build
+
+# 2. Read index.html
+$indexPath = Join-Path (Resolve-Path "./build") "index.html"
+$htmlContent = Get-Content $indexPath -Raw
+
+# 3. Convert to Base64 (Dataverse requires this)
+$base64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($htmlContent))
+
+# 4. Dataverse environment URL
+$environmentUrl = "https://usgs-ipds-dev.crm.dynamics.com"
+
+# 5. Interactive login (no client secret)
+$token = Get-MsalToken -Scopes "$environmentUrl/.default" -Interactive
+$accessToken = $token.AccessToken
+
+# 6. Get the web resource
+$webResourceName = "new_mywebresource.html"
+$lookupUrl = "$environmentUrl/api/data/v9.2/webresourceset?$filter=name eq '$webResourceName'"
+
+$wr = Invoke-RestMethod -Method Get -Uri $lookupUrl -Headers @{
+    Authorization = "Bearer $accessToken"
+}
+
+if ($wr.value.Count -eq 0) {
+    Write-Host "Web resource not found: $webResourceName"
+    exit
+}
+
+$webResourceId = $wr.value[0].webresourceid
+
+# 7. Update the web resource content
+$updateUrl = "$environmentUrl/api/data/v9.2/webresourceset($webResourceId)"
+
+$payload = @{
+    content = $base64
+}
+
+Invoke-RestMethod -Method Patch -Uri $updateUrl -Headers @{
+    Authorization = "Bearer $accessToken"
+    "Content-Type" = "application/json"
+} -Body ($payload | ConvertTo-Json)
+
+Write-Host "Web resource updated."
+
+# 8. Publish the web resource
+$publishUrl = "$environmentUrl/api/data/v9.2/PublishXml"
+
+$publishPayload = @{
+    ParameterXml = "<importexportxml><webresources><webresource>$webResourceId</webresource></webresources></importexportxml>"
+}
+
+Invoke-RestMethod -Method Post -Uri $publishUrl -Headers @{
+    Authorization = "Bearer $accessToken"
+    "Content-Type" = "application/json"
+} -Body ($publishPayload | ConvertTo-Json)
+
+Write-Host "Web resource published successfully."
