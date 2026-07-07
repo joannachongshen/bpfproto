@@ -182,7 +182,6 @@ const IP_WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_workflowgroupnumber'
 // its number (usgs_workflowgroupnumber), so we find the group record whose
 // number matches the IP's, then $expand its related stages.
 const WORKFLOW_GROUP_ENTITY = 'usgs_workflowgroup' // TODO verify entity logical name
-const WORKFLOW_GROUP_ID_FIELD = 'usgs_workflowgroupid' // TODO verify primary-id logical name
 const WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_workflowgroupnumber' // the 1–7 number column ON the group entity (used to find the group by the IP's number)
 // Many-to-many relationship / navigation property linking a group to its stages.
 const GROUP_STAGE_MN_NAV = 'usgs_workflowgroup_usgs_workflowstage' // TODO verify it resolves as an $expand navigation property
@@ -215,15 +214,6 @@ function isTruthy(value: unknown): boolean {
     value === '1' ||
     /^(true|yes)$/i.test(String(value ?? ''))
   )
-}
-
-// Extracts the parent approval-stage name from a comment-reconciliation stage
-// name following the "<Approval Stage> - Address Comment(s)" convention, or null
-// if the name isn't a comment-reconciliation stage. Used to position the
-// reconciliation stage immediately after its related approval stage.
-function addressCommentsParent(stageName: string): string | null {
-  const match = stageName.match(/^(.*?)\s*-\s*address comments?$/i)
-  return match ? match[1].trim() : null
 }
 
 function buildStagesQuery(workflowId: string): string {
@@ -598,7 +588,13 @@ async function fetchRecordWorkflow(): Promise<{
   const xrm = getXrmContext()
   const formContext = getFormContext()
 
+  console.groupCollapsed('[WorkflowVisualizer] fetchRecordWorkflow')
+  console.log('xrm context present', !!xrm)
+  console.log('formContext', formContext)
+
   if (!xrm || !formContext?.entityName || !formContext?.recordId) {
+    console.log('aborting: no Xrm context or no form context')
+    console.groupEnd()
     return {}
   }
 
@@ -608,14 +604,17 @@ async function fetchRecordWorkflow(): Promise<{
       formContext.recordId,
       '?$select=_usgs_workflowstageid_value,_usgs_workflowid_value,usgs_legacymigration',
     )
+    console.log('raw record (stage/workflow/legacy fields)', record)
 
     const stageId = asGuid(record['_usgs_workflowstageid_value'])
     const isLegacy = isTruthy(record['usgs_legacymigration'])
+    console.log('parsed stageId', stageId, 'isLegacy', isLegacy)
 
     // The IP carries the workflow lookup directly. Migrated legacy records may
     // leave it empty, so fall back to the workflow on the current stage record.
     let workflowId = asGuid(record['_usgs_workflowid_value'])
     if (!workflowId && stageId) {
+      console.log('workflowId missing on IP; falling back to stage record lookup')
       try {
         const stageRec = await xrm.WebApi.retrieveRecord(
           'usgs_workflowstage',
@@ -623,15 +622,20 @@ async function fetchRecordWorkflow(): Promise<{
           '?$select=_usgs_workflow_value',
         )
         workflowId = asGuid(stageRec['_usgs_workflow_value'])
-      } catch {
-        // Stage lookup unavailable; leave workflowId undefined.
+        console.log('workflowId from stage record fallback', workflowId)
+      } catch (error) {
+        console.warn('[WorkflowVisualizer] stage-record workflowId fallback failed', error)
       }
     }
 
     const { groupNumber, groupStageIds } = await fetchGroupStageIds(xrm, formContext)
 
+    console.log('resolved output', { stageId, workflowId, groupNumber, groupStageIds, isLegacy })
+    console.groupEnd()
     return { stageId, workflowId, groupNumber, groupStageIds, isLegacy }
-  } catch {
+  } catch (error) {
+    console.warn('[WorkflowVisualizer] fetchRecordWorkflow failed', error)
+    console.groupEnd()
     return {}
   }
 }
@@ -648,13 +652,18 @@ async function readWorkflowGroupNumber(
   xrm: XrmContext,
   formContext: FormContext,
 ): Promise<number | null> {
+  const query = `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}`
+  console.log('[WorkflowVisualizer] readWorkflowGroupNumber query', query)
   try {
     const record = await xrm.WebApi.retrieveRecord(
       formContext.entityName,
       formContext.recordId,
-      `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}`,
+      query,
     )
-    return readOptionSetValue(record, IP_WORKFLOW_GROUP_NUMBER_FIELD)
+    console.log('[WorkflowVisualizer] readWorkflowGroupNumber raw record', record)
+    const groupNumber = readOptionSetValue(record, IP_WORKFLOW_GROUP_NUMBER_FIELD)
+    console.log('[WorkflowVisualizer] readWorkflowGroupNumber parsed value', groupNumber)
+    return groupNumber
   } catch (error) {
     console.warn('[WorkflowVisualizer] failed to read workflow group number', error)
     return null
@@ -664,14 +673,22 @@ async function readWorkflowGroupNumber(
 // Sorts M:N-expanded stage rows by sequence number and returns their stage IDs
 // (lowercased) — the ordered display path.
 function toOrderedStageIds(related: GroupStageRow[]): string[] {
-  return related
+  const sorted = [...related]
     .filter((row) => row[WORKFLOW_STAGE_ID_FIELD])
     .sort(
       (left, right) =>
         (left[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0) -
         (right[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0),
     )
-    .map((row) => String(row[WORKFLOW_STAGE_ID_FIELD]).toLowerCase())
+  console.log(
+    '[WorkflowVisualizer] toOrderedStageIds sorted by sequence',
+    sorted.map((row) => ({
+      id: row[WORKFLOW_STAGE_ID_FIELD],
+      name: row[WORKFLOW_STAGE_NAME_FIELD],
+      sequence: row[WORKFLOW_STAGE_SEQUENCE_FIELD],
+    })),
+  )
+  return sorted.map((row) => String(row[WORKFLOW_STAGE_ID_FIELD]).toLowerCase())
 }
 
 // Returns the ordered list of stage IDs (lowercased) for the IP's Workflow Group
@@ -698,43 +715,59 @@ async function fetchGroupStageIds(
 
   // Primary — resolve the group record by its number and expand its M:N stages.
   if (groupNumber !== null) {
+    const groupQuery =
+      `?$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})` +
+      `&$filter=${WORKFLOW_GROUP_NUMBER_FIELD} eq ${groupNumber}`
+    console.log('group-table path: entity', WORKFLOW_GROUP_ENTITY, 'query', groupQuery)
     try {
       const groups = await xrm.WebApi.retrieveMultipleRecords(
         WORKFLOW_GROUP_ENTITY,
-        `?$select=${WORKFLOW_GROUP_ID_FIELD}` +
-          `&$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})` +
-          `&$filter=${WORKFLOW_GROUP_NUMBER_FIELD} eq ${groupNumber}`,
+        groupQuery,
       )
+      console.log('group-table path: matching group records found', groups.entities.length)
       const groupRecord = groups.entities[0] as Record<string, unknown> | undefined
+      console.log('group-table path: group record', groupRecord)
       const related =
         (groupRecord?.[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
-      console.log('group-table path: related stages', related)
+      console.log('group-table path: related stages (raw expand)', related)
       const ids = toOrderedStageIds(related)
       if (ids.length > 0) {
-        console.log('ordered group stage ids (group-table path)', ids)
+        console.log('ordered group stage ids (group-table path) — SUCCESS', ids)
         console.groupEnd()
         return { groupNumber, groupStageIds: ids }
       }
+      console.log('group-table path produced zero stages; falling back to IP-side expand')
     } catch (error) {
       console.warn(
         '[WorkflowVisualizer] group-table path failed; trying IP-side expand',
         error,
       )
     }
+  } else {
+    console.log('no workflow group number on IP; skipping group-table path, trying IP-side expand')
   }
 
   // Safety net — expand the relationship directly on the Information Product.
+  const ipQuery =
+    `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}` +
+    `&$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})`
+  console.log('IP-side path: entity', formContext.entityName, 'query', ipQuery)
   try {
     const record = await xrm.WebApi.retrieveRecord(
       formContext.entityName,
       formContext.recordId,
-      `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}` +
-        `&$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})`,
+      ipQuery,
     )
+    console.log('IP-side path: raw IP record', record)
     const related = (record[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
-    console.log('IP-side path: related stages', related)
+    console.log('IP-side path: related stages (raw expand)', related)
     const ids = toOrderedStageIds(related)
-    console.log('ordered group stage ids (IP-side path)', ids)
+    console.log(
+      ids.length > 0
+        ? 'ordered group stage ids (IP-side path) — SUCCESS'
+        : 'ordered group stage ids (IP-side path) — EMPTY, both paths failed',
+      ids,
+    )
     console.groupEnd()
     return { groupNumber, groupStageIds: ids.length > 0 ? ids : null }
   } catch (error) {
@@ -766,9 +799,9 @@ function normalizeWorkflowStages(rows: DataverseWorkflowStageRow[]): WorkflowSta
 }
 
 // Inserts a stage into an already-ordered list at the position implied by its
-// global sequence number (before the first stage with a greater sequence). Used
-// for off-path stages that DON'T follow the "Address Comments" naming convention
-// — their global sequence sits correctly between the surrounding stages.
+// global sequence number (before the first already-placed stage with a greater
+// sequence). This is how EVERY optional/off-path stage is positioned — no name
+// pattern is special-cased. usgs_sequencenumber is the sole ordering authority.
 function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): void {
   let insertAt = placed.length
   for (let i = 0; i < placed.length; i++) {
@@ -777,31 +810,50 @@ function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): 
       break
     }
   }
+  console.log(
+    `[WorkflowVisualizer] insertByGlobalSequence: inserting "${stage.stageName}" (seq ${stage.sequenceNumber}) at index ${insertAt}`,
+    {
+      before: placed[insertAt - 1]
+        ? `${placed[insertAt - 1].stageName} (seq ${placed[insertAt - 1].sequenceNumber})`
+        : '(start of list)',
+      after: placed[insertAt]
+        ? `${placed[insertAt].stageName} (seq ${placed[insertAt].sequenceNumber})`
+        : '(end of list)',
+    },
+  )
   placed.splice(insertAt, 0, stage)
 }
 
 // Builds the ordered list of stages to DISPLAY for a record. Places the stages
 // belonging to the record's Workflow Group (from the M:N relationship) in their
 // sequence order, matched by stage ID (each stage at most once, so a stage the
-// record revisited still appears only once). Then grafts in the off-path stages
-// the record actually landed on (visited / current) — primarily comment-
-// reconciliation ("<Approval> - Address Comments") stages, which are NOT part of
-// a group's stage set and appear ONLY when the record was routed through them,
-// positioned immediately after their parent approval stage. When no group is
-// assigned (groupStageIds null), nothing is pre-placed and only the visited/
-// current stages show — the visualizer never guesses a path.
+// record revisited still appears only once). Then grafts in any OPTIONAL stage
+// the record actually landed on (visited or is currently on) but that is NOT
+// part of the group's stage set — e.g. an optional BAO Approval an approver
+// routed to, or a comment-reconciliation stage. Optional stages are identified
+// purely by group membership, never by name; once landed on, an optional stage
+// is positioned by its own usgs_sequencenumber relative to the already-placed
+// group stages, and it stays visible even after the record moves past it. An
+// optional stage never routed to is not part of the group's stage set, so it
+// simply never gets placed — it does not display as a future stage. When no
+// group is assigned (groupStageIds null), nothing is pre-placed and only the
+// visited/current stages show — the visualizer never guesses a path.
 function buildOrderedDisplay(
   stages: WorkflowStage[],
   groupStageIds: string[] | null,
   currentStage: WorkflowStage | undefined,
   visited: (stage: WorkflowStage) => boolean,
 ): WorkflowStage[] {
+  console.groupCollapsed('[WorkflowVisualizer] buildOrderedDisplay')
+  console.log('input: total stages in catalog', stages.length)
+  console.log('input: groupStageIds', groupStageIds)
+  console.log('input: currentStage', currentStage?.stageName, currentStage?.id)
+
   const byId = new Map<string, WorkflowStage>()
   for (const stage of stages) {
     byId.set(stage.id.toLowerCase(), stage)
   }
 
-  const currentNameLower = currentStage?.stageName.toLowerCase()
   const placed: WorkflowStage[] = []
   const placedIds = new Set<string>()
 
@@ -810,58 +862,61 @@ function buildOrderedDisplay(
   if (groupStageIds) {
     for (const stageId of groupStageIds) {
       const stage = byId.get(stageId)
-      if (!stage || placedIds.has(stage.id)) {
+      if (!stage) {
+        console.warn(
+          `[WorkflowVisualizer] groupStageIds contained id "${stageId}" with no matching stage in the fetched catalog — skipped`,
+        )
+        continue
+      }
+      if (placedIds.has(stage.id)) {
         continue
       }
       placed.push(stage)
       placedIds.add(stage.id)
     }
+  } else {
+    console.log('no groupStageIds — starting with an empty group path')
   }
+  console.log(
+    'after step 1 (group stages placed)',
+    placed.map((s) => s.stageName),
+  )
 
-  // 2. Graft in the off-path stages the record actually landed on (visited or
-  //    current) — primarily comment-reconciliation stages. Only the specific
-  //    stage(s) the record reached appear; the rest stay hidden. Each
-  //    reconciliation stage is placed immediately after its parent approval
-  //    stage (its global sequence is unreliable); any other off-path stage is
-  //    positioned by global sequence. Sorted by sequence so multiple extras keep
-  //    a stable order.
+  // 2. Graft in optional stages the record actually landed on (visited, or is
+  //    the current stage — matched by id, not name). Only the specific stage(s)
+  //    the record reached appear; every other optional stage stays hidden.
+  //    Sorted by sequence, then each is positioned by its own sequence number
+  //    relative to the group stages already placed.
   const offPathLanded = stages
     .filter(
       (stage) =>
         !placedIds.has(stage.id) &&
-        (visited(stage) || stage.stageName.toLowerCase() === currentNameLower),
+        (visited(stage) || stage.id === currentStage?.id),
     )
     .sort((left, right) => left.sequenceNumber - right.sequenceNumber)
+
+  console.log(
+    'optional stages landed on but not in group path (will be grafted)',
+    offPathLanded.map((s) => ({
+      name: s.stageName,
+      sequence: s.sequenceNumber,
+      reason: s.id === currentStage?.id ? 'current' : 'visited',
+    })),
+  )
 
   for (const stage of offPathLanded) {
     if (placedIds.has(stage.id)) {
       continue
     }
-    const parent = addressCommentsParent(stage.stageName)
-    if (parent) {
-      const parentLower = parent.toLowerCase()
-      const parentIndex = placed.findIndex(
-        (placedStage) => placedStage.stageName.toLowerCase() === parentLower,
-      )
-      if (parentIndex === -1) {
-        insertByGlobalSequence(placed, stage)
-      } else {
-        // Insert after the parent and after any sibling reconciliation stages
-        // already placed directly after it.
-        let insertAt = parentIndex + 1
-        while (
-          insertAt < placed.length &&
-          addressCommentsParent(placed[insertAt].stageName)?.toLowerCase() === parentLower
-        ) {
-          insertAt++
-        }
-        placed.splice(insertAt, 0, stage)
-      }
-    } else {
-      insertByGlobalSequence(placed, stage)
-    }
+    insertByGlobalSequence(placed, stage)
     placedIds.add(stage.id)
   }
+
+  console.log(
+    'output: final display order',
+    placed.map((s) => `${s.stageName} (seq ${s.sequenceNumber})`),
+  )
+  console.groupEnd()
 
   return placed
 }
@@ -1084,6 +1139,7 @@ function App() {
   // shows the loading state via the initial loadState/sourceLabel values.
   const loadStages = useCallback(async (options?: { silent?: boolean }) => {
     const silent = options?.silent ?? false
+    console.groupCollapsed(`[WorkflowVisualizer] loadStages (silent=${silent})`)
 
     try {
       const [
@@ -1097,25 +1153,44 @@ function App() {
         taskHistory,
       ] = await Promise.all([fetchRecordWorkflow(), fetchTaskHistory()])
 
+      console.log('fetchRecordWorkflow result', {
+        stageId,
+        workflowId,
+        groupNumber: nextGroupNumber,
+        groupStageIds: nextGroupStageIds,
+        isLegacy: nextIsLegacy,
+      })
+      console.log('fetchTaskHistory result', {
+        visitedStages: [...taskHistory.visitedStages],
+        completionByStage: Object.fromEntries(taskHistory.completionByStage),
+      })
+
       if (!mountedRef.current) {
+        console.log('component unmounted mid-fetch; discarding results')
+        console.groupEnd()
         return
       }
 
       if (!workflowId) {
+        console.warn('no workflowId resolved — cannot render any stages')
         if (!silent) {
           setSourceLabel(
             'No workflow is associated with this record. Set the workflow stage to visualize the workflow.',
           )
           setLoadState('error')
         }
+        console.groupEnd()
         return
       }
 
       setCurrentWorkflowId(workflowId)
 
       const { rows: nextRows, source } = await fetchWorkflowStages(workflowId)
+      console.log('fetchWorkflowStages result', { rowCount: nextRows.length, source })
 
       if (!mountedRef.current) {
+        console.log('component unmounted mid-fetch (after stage fetch); discarding results')
+        console.groupEnd()
         return
       }
 
@@ -1129,8 +1204,12 @@ function App() {
       setIsLegacy(nextIsLegacy ?? false)
       setSourceLabel(source)
       setLoadState('ready')
+      console.log('state applied — loadState set to ready')
+      console.groupEnd()
     } catch (error) {
+      console.warn('[WorkflowVisualizer] loadStages failed', error)
       if (!mountedRef.current || silent) {
+        console.groupEnd()
         return
       }
 
@@ -1140,6 +1219,7 @@ function App() {
           : 'Dataverse did not return workflow stages.',
       )
       setLoadState('error')
+      console.groupEnd()
     }
   }, [])
 
