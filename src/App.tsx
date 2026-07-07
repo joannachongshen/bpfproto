@@ -190,6 +190,7 @@ const GROUP_STAGE_MN_NAV = 'usgs_workflowgroup_usgs_workflowstage' // TODO verif
 const WORKFLOW_STAGE_ID_FIELD = 'usgs_workflowstageid'
 const WORKFLOW_STAGE_NAME_FIELD = 'usgs_name' // TODO verify (matches existing usgs_workflowstage query)
 const WORKFLOW_STAGE_SEQUENCE_FIELD = 'usgs_sequencenumber' // TODO verify (matches existing usgs_workflowstage query)
+const WORKFLOW_STAGE_DESCRIPTION_FIELD = 'usgs_description' // matches existing usgs_workflowstage query
 
 // Reads an option-set/numeric column as its raw numeric value (null when absent).
 function readOptionSetValue(
@@ -582,7 +583,7 @@ async function fetchRecordWorkflow(): Promise<{
   stageId?: string
   workflowId?: string
   groupNumber?: number | null
-  groupStageIds?: string[] | null
+  groupStages?: WorkflowStage[] | null
   isLegacy?: boolean
 }> {
   const xrm = getXrmContext()
@@ -628,11 +629,17 @@ async function fetchRecordWorkflow(): Promise<{
       }
     }
 
-    const { groupNumber, groupStageIds } = await fetchGroupStageIds(xrm, formContext)
+    const { groupNumber, groupStages } = await fetchGroupStages(xrm, formContext)
 
-    console.log('resolved output', { stageId, workflowId, groupNumber, groupStageIds, isLegacy })
+    console.log('resolved output', {
+      stageId,
+      workflowId,
+      groupNumber,
+      groupStageCount: groupStages?.length ?? 0,
+      isLegacy,
+    })
     console.groupEnd()
-    return { stageId, workflowId, groupNumber, groupStageIds, isLegacy }
+    return { stageId, workflowId, groupNumber, groupStages, isLegacy }
   } catch (error) {
     console.warn('[WorkflowVisualizer] fetchRecordWorkflow failed', error)
     console.groupEnd()
@@ -643,8 +650,20 @@ async function fetchRecordWorkflow(): Promise<{
 // One row of the M:N-expanded group→stage set (only the fields we select).
 type GroupStageRow = Record<string, unknown> & {
   [WORKFLOW_STAGE_ID_FIELD]?: string
+  [WORKFLOW_STAGE_NAME_FIELD]?: string
   [WORKFLOW_STAGE_SEQUENCE_FIELD]?: number
+  [WORKFLOW_STAGE_DESCRIPTION_FIELD]?: string
 }
+
+// The columns selected on each M:N-related stage (also used by the IP-side
+// safety-net query). Enough to render the stage directly — no separate catalog
+// fetch is required for the group's own stages.
+const GROUP_STAGE_SELECT = [
+  WORKFLOW_STAGE_ID_FIELD,
+  WORKFLOW_STAGE_NAME_FIELD,
+  WORKFLOW_STAGE_SEQUENCE_FIELD,
+  WORKFLOW_STAGE_DESCRIPTION_FIELD,
+].join(',')
 
 // Reads the IP's Workflow Group number (usgs_workflowgroupnumber — a whole
 // number, 1–7). Null when no group is assigned or the field can't be read.
@@ -670,9 +689,11 @@ async function readWorkflowGroupNumber(
   }
 }
 
-// Sorts M:N-expanded stage rows by sequence number and returns their stage IDs
-// (lowercased) — the ordered display path.
-function toOrderedStageIds(related: GroupStageRow[]): string[] {
+// Converts M:N-expanded stage rows into WorkflowStage objects, sorted by
+// sequence number — the group's ordered display path. Because the M:N expand
+// selects id/name/sequence/description, these stages can be rendered directly
+// without a separate workflow-catalog fetch.
+function groupRowsToStages(related: GroupStageRow[]): WorkflowStage[] {
   const sorted = [...related]
     .filter((row) => row[WORKFLOW_STAGE_ID_FIELD])
     .sort(
@@ -680,23 +701,30 @@ function toOrderedStageIds(related: GroupStageRow[]): string[] {
         (left[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0) -
         (right[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0),
     )
+    .map((row) => ({
+      id: String(row[WORKFLOW_STAGE_ID_FIELD]),
+      stage: '',
+      stageName: String(row[WORKFLOW_STAGE_NAME_FIELD] ?? ''),
+      sequenceNumber: Number(row[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0),
+      description: String(row[WORKFLOW_STAGE_DESCRIPTION_FIELD] ?? ''),
+      workflowName: 'Workflow',
+      workflowDescription: '',
+    }))
   console.log(
-    '[WorkflowVisualizer] toOrderedStageIds sorted by sequence',
-    sorted.map((row) => ({
-      id: row[WORKFLOW_STAGE_ID_FIELD],
-      name: row[WORKFLOW_STAGE_NAME_FIELD],
-      sequence: row[WORKFLOW_STAGE_SEQUENCE_FIELD],
-    })),
+    '[WorkflowVisualizer] groupRowsToStages sorted by sequence',
+    sorted.map((s) => ({ id: s.id, name: s.stageName, sequence: s.sequenceNumber })),
   )
-  return sorted.map((row) => String(row[WORKFLOW_STAGE_ID_FIELD]).toLowerCase())
+  return sorted
 }
 
-// Returns the ordered list of stage IDs (lowercased) for the IP's Workflow Group
-// via the many-to-many relationship, sorted by sequence number — the record's
-// display path. groupStageIds is null when no group / no related stages, which
-// drives the "visited only" fallback + no-group notice. Independently guarded so
-// a bad binding only disables path selection; the stage list still renders from
-// task history.
+// Returns the IP's Workflow Group number + the group's ordered stages (as
+// WorkflowStage objects) from the many-to-many relationship, sorted by sequence
+// number — the record's display path. This is the SOLE driver of the path:
+// groupNumber selects the group, the M:N supplies its stages. groupStages is
+// null when no group / no related stages, which drives the "visited only"
+// fallback + no-group notice. Nothing here depends on the IP's workflow lookup
+// (`usgs_workflowid`); a record with a group number but no workflow lookup still
+// renders its full path.
 //
 // Primary path (confirmed topology): the relationship links a usgs_workflowgroup
 // record (keyed by usgs_workflowgroupnumber) to its stages, so we find the group
@@ -704,10 +732,10 @@ function toOrderedStageIds(related: GroupStageRow[]): string[] {
 // relationship is actually defined on the Information Product): $expand the same
 // navigation property on the IP record itself. The console logs show which path
 // produced stages, so a wrong schema name is easy to spot.
-async function fetchGroupStageIds(
+async function fetchGroupStages(
   xrm: XrmContext,
   formContext: FormContext,
-): Promise<{ groupNumber: number | null; groupStageIds: string[] | null }> {
+): Promise<{ groupNumber: number | null; groupStages: WorkflowStage[] | null }> {
   const groupNumber = await readWorkflowGroupNumber(xrm, formContext)
 
   console.groupCollapsed('[WorkflowVisualizer] workflow group')
@@ -716,7 +744,7 @@ async function fetchGroupStageIds(
   // Primary — resolve the group record by its number and expand its M:N stages.
   if (groupNumber !== null) {
     const groupQuery =
-      `?$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})` +
+      `?$expand=${GROUP_STAGE_MN_NAV}($select=${GROUP_STAGE_SELECT})` +
       `&$filter=${WORKFLOW_GROUP_NUMBER_FIELD} eq ${groupNumber}`
     console.log('group-table path: entity', WORKFLOW_GROUP_ENTITY, 'query', groupQuery)
     try {
@@ -730,11 +758,11 @@ async function fetchGroupStageIds(
       const related =
         (groupRecord?.[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
       console.log('group-table path: related stages (raw expand)', related)
-      const ids = toOrderedStageIds(related)
-      if (ids.length > 0) {
-        console.log('ordered group stage ids (group-table path) — SUCCESS', ids)
+      const groupStages = groupRowsToStages(related)
+      if (groupStages.length > 0) {
+        console.log('group stages (group-table path) — SUCCESS', groupStages.map((s) => s.stageName))
         console.groupEnd()
-        return { groupNumber, groupStageIds: ids }
+        return { groupNumber, groupStages }
       }
       console.log('group-table path produced zero stages; falling back to IP-side expand')
     } catch (error) {
@@ -750,7 +778,7 @@ async function fetchGroupStageIds(
   // Safety net — expand the relationship directly on the Information Product.
   const ipQuery =
     `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}` +
-    `&$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})`
+    `&$expand=${GROUP_STAGE_MN_NAV}($select=${GROUP_STAGE_SELECT})`
   console.log('IP-side path: entity', formContext.entityName, 'query', ipQuery)
   try {
     const record = await xrm.WebApi.retrieveRecord(
@@ -761,15 +789,15 @@ async function fetchGroupStageIds(
     console.log('IP-side path: raw IP record', record)
     const related = (record[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
     console.log('IP-side path: related stages (raw expand)', related)
-    const ids = toOrderedStageIds(related)
+    const groupStages = groupRowsToStages(related)
     console.log(
-      ids.length > 0
-        ? 'ordered group stage ids (IP-side path) — SUCCESS'
-        : 'ordered group stage ids (IP-side path) — EMPTY, both paths failed',
-      ids,
+      groupStages.length > 0
+        ? 'group stages (IP-side path) — SUCCESS'
+        : 'group stages (IP-side path) — EMPTY, both paths failed',
+      groupStages.map((s) => s.stageName),
     )
     console.groupEnd()
-    return { groupNumber, groupStageIds: ids.length > 0 ? ids : null }
+    return { groupNumber, groupStages: groupStages.length > 0 ? groupStages : null }
   } catch (error) {
     // Requirement 3: don't crash when no group / no stages. The caller shows a
     // notice; the stepper still renders whatever the task history yields.
@@ -778,7 +806,7 @@ async function fetchGroupStageIds(
       error,
     )
     console.groupEnd()
-    return { groupNumber, groupStageIds: null }
+    return { groupNumber, groupStages: null }
   }
 }
 
@@ -1094,10 +1122,12 @@ function CommentBadge() {
 }
 
 function App() {
-  const [rows, setRows] = useState<DataverseWorkflowStageRow[]>([])
+  // The display catalog: the group's stages (from the M:N) merged with the full
+  // workflow catalog when available. Built in loadStages; no longer derived from
+  // a single raw-rows fetch, since the group's stages are the primary source.
+  const [stages, setStages] = useState<WorkflowStage[]>([])
   const [loadState, setLoadState] = useState<LoadState>('loading')
   const [sourceLabel, setSourceLabel] = useState('Loading workflow stages.')
-  const stages = useMemo(() => normalizeWorkflowStages(rows), [rows])
   const [currentStageId, setCurrentStageId] = useState<string | null>(null)
   const [currentWorkflowId, setCurrentWorkflowId] = useState<string | null>(null)
   const [completionByStage, setCompletionByStage] = useState<Map<string, string>>(
@@ -1147,7 +1177,7 @@ function App() {
           stageId,
           workflowId,
           groupNumber: nextGroupNumber,
-          groupStageIds: nextGroupStageIds,
+          groupStages: nextGroupStages,
           isLegacy: nextIsLegacy,
         },
         taskHistory,
@@ -1157,7 +1187,7 @@ function App() {
         stageId,
         workflowId,
         groupNumber: nextGroupNumber,
-        groupStageIds: nextGroupStageIds,
+        groupStageCount: nextGroupStages?.length ?? 0,
         isLegacy: nextIsLegacy,
       })
       console.log('fetchTaskHistory result', {
@@ -1171,38 +1201,73 @@ function App() {
         return
       }
 
-      if (!workflowId) {
-        console.warn('no workflowId resolved — cannot render any stages')
-        if (!silent) {
-          setSourceLabel(
-            'No workflow is associated with this record. Set the workflow stage to visualize the workflow.',
+      // The group's stages (from the M:N) are the primary display catalog and
+      // path — driven by the workflow GROUP NUMBER, not the workflow lookup. The
+      // full workflow catalog is fetched only as a best-effort SUPPLEMENT, to
+      // resolve the names of any off-path stages (optional / reconciliation
+      // stages the record was routed to) that aren't in the group's stage set.
+      // A missing workflow lookup therefore no longer blocks rendering.
+      const groupStages = nextGroupStages ?? []
+      let supplementStages: WorkflowStage[] = []
+      if (workflowId) {
+        setCurrentWorkflowId(workflowId)
+        try {
+          const { rows: nextRows, source } = await fetchWorkflowStages(workflowId)
+          supplementStages = normalizeWorkflowStages(nextRows)
+          console.log('supplement catalog (full workflow) result', {
+            rowCount: nextRows.length,
+            source,
+          })
+        } catch (error) {
+          console.warn(
+            '[WorkflowVisualizer] supplement catalog fetch failed; rendering group stages only',
+            error,
           )
-          setLoadState('error')
         }
-        console.groupEnd()
-        return
+      } else {
+        setCurrentWorkflowId(null)
+        console.log('no workflow lookup on IP; rendering from group stages + task history only')
       }
-
-      setCurrentWorkflowId(workflowId)
-
-      const { rows: nextRows, source } = await fetchWorkflowStages(workflowId)
-      console.log('fetchWorkflowStages result', { rowCount: nextRows.length, source })
 
       if (!mountedRef.current) {
-        console.log('component unmounted mid-fetch (after stage fetch); discarding results')
+        console.log('component unmounted mid-fetch (after supplement fetch); discarding results')
         console.groupEnd()
         return
       }
 
-      setRows(nextRows)
+      // Merge: group stages first (authoritative for the path), then any
+      // supplement stages not already present (dedup by id). buildOrderedDisplay
+      // reads the path order from groupStageIds; the catalog just supplies the
+      // stage objects (names/sequence) for both group and off-path stages.
+      const mergedById = new Map<string, WorkflowStage>()
+      for (const stage of [...groupStages, ...supplementStages]) {
+        const key = stage.id.toLowerCase()
+        if (!mergedById.has(key)) {
+          mergedById.set(key, stage)
+        }
+      }
+      const mergedStages = [...mergedById.values()]
+      const nextGroupStageIds =
+        nextGroupStages && nextGroupStages.length > 0
+          ? nextGroupStages.map((stage) => stage.id.toLowerCase())
+          : null
+
+      console.log('merged catalog stage count', mergedStages.length)
+      console.log('derived groupStageIds', nextGroupStageIds)
+
+      setStages(mergedStages)
       setCurrentStageId(stageId ? stageId.toLowerCase() : null)
       setCompletionByStage(taskHistory.completionByStage)
       setTaskDetailByStage(taskHistory.taskDetailByStage)
       setVisitedStages(taskHistory.visitedStages)
-      setGroupStageIds(nextGroupStageIds ?? null)
+      setGroupStageIds(nextGroupStageIds)
       setGroupNumber(nextGroupNumber ?? null)
       setIsLegacy(nextIsLegacy ?? false)
-      setSourceLabel(source)
+      setSourceLabel(
+        nextGroupStageIds
+          ? `Workflow group ${nextGroupNumber ?? '—'}`
+          : 'No workflow group stages resolved.',
+      )
       setLoadState('ready')
       console.log('state applied — loadState set to ready')
       console.groupEnd()
