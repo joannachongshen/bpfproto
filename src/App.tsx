@@ -153,124 +153,46 @@ const TASK_DUE_DATE_FIELD = 'usgs_requestedduedatefornexttask'
 const REFRESH_INTERVAL_MS = 30000
 
 // ---------------------------------------------------------------------------
-// Workflow group model.
+// Workflow group → stages (dynamic, from Dataverse — NOT hard-coded).
 //
-// The IPDS workflow is a single shared catalog of stages (usgs_workflowstage);
-// which of those stages a given Information Product actually travels through is
-// determined by its "workflow group" (1–7). The group is derived in code from
-// the IP's product type plus a few routing conditions (determineGroup), and each
-// group maps to a fixed, ordered list of stages to DISPLAY (GROUP_PATHS).
+// Which stages an Information Product displays is driven by its Workflow Group.
+// The IP record carries a workflow group (usgs_WorkflowGroupNumber); Workflow
+// Stages are tied to Workflow Groups by a many-to-many relationship. At runtime
+// we read the IP's group, then query the stages associated with that group,
+// ordered by their sequence number — that ordered set IS the record's display
+// path. Past/current status still comes from the IPDS task history; comment-
+// reconciliation ("<Approval> - Address Comments") stages are not part of a
+// group's stage set and appear only when the record was actually routed through
+// them (visited / current).
 //
-// The seven stage lists below are taken verbatim from the user-story acceptance
-// criteria / the IPDS workflow configuration spreadsheet. Stage names must match
-// usgs_workflowstage.usgs_name (compared case-insensitively) for a stage to
-// render — a name in a path that has no matching stage row is simply skipped.
-//
-// Comment-reconciliation ("<Approval> - Address Comments") stages are NOT part
-// of any group path. They are exception stages shown only when the record has
-// actually been routed through them (visited or current).
+// NOTE: several logical names below could not be verified against a live
+// environment. They are marked "TODO verify" — confirm each against Dataverse
+// table metadata before relying on this in production.
 // ---------------------------------------------------------------------------
 
-const GROUP_PATHS: Record<number, string[]> = {
-  1: [
-    'Prepare Record',
-    'Supervisory Approval',
-    'Center Approval',
-    'BAO Approval',
-    'Dissemination',
-  ],
-  2: [
-    'Prepare Record',
-    'Approve for Peer Review',
-    'Peer Review and Reconciliation',
-    'Supervisory Approval',
-    'Center Approval',
-    'Dissemination',
-  ],
-  3: [
-    'Prepare Record',
-    'Approve for Peer Review',
-    'Peer Review and Reconciliation',
-    'Supervisory Approval',
-    'Center Approval',
-    'BAO Approval',
-    'Dissemination',
-  ],
-  4: [
-    'Prepare Record',
-    'Approve for Peer Review',
-    'Peer Review and Reconciliation',
-    'Supervisory Approval',
-    'Center Approval',
-    'BAO Approval',
-    'Upload Accepted Manuscript',
-    'SPN Production of Accepted Manuscript',
-    'Dissemination',
-  ],
-  5: ['Prepare Record', 'Dissemination'],
-  6: [
-    'Prepare Record',
-    'Approve for Peer Review',
-    'Peer Review and Reconciliation',
-    'Approve for SPN Edit',
-    'Prepare for SPN Edit',
-    'Initial SPN Edit',
-    'Response to SPN Edit',
-    'SPN Edit Approval',
-    'Supervisory Approval',
-    'Center Approval',
-    'Prepare for SPN Production',
-    'SPN Production',
-    'Response to SPN Author Proof',
-    'Web Citation Page',
-    'Response to Web Citation Page',
-    'Dissemination',
-  ],
-  7: [
-    'Prepare Record',
-    'Approve for Peer Review',
-    'Peer Review and Reconciliation',
-    'Approve for SPN Edit',
-    'Prepare for SPN Edit',
-    'Initial SPN Edit',
-    'Response to SPN Edit',
-    'SPN Edit Approval',
-    'Supervisory Approval',
-    'Center Approval',
-    'BAO Approval',
-    'Prepare for SPN Production',
-    'SPN Production',
-    'Response to SPN Author Proof',
-    'Web Citation Page',
-    'Response to Web Citation Page',
-    'Dissemination',
-  ],
-}
+// --- Information Product: workflow group field -----------------------------
+// usgs_WorkflowGroupNumber is a WHOLE NUMBER column (1–7) on the IP (confirmed
+// by smueller 2026-07-06). It identifies which Workflow Group the record belongs
+// to; the group's stages come from the M:N relationship below.
+const IP_WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_workflowgroupnumber'
 
-// --- IP routing field bindings ---------------------------------------------
-// The columns read from the Information Product to derive its workflow group.
-// Peer-review-required is intentionally NOT read: routing is driven by product
-// type + escalation (new interpretive content or a Special Product Alert) +
-// open-access / outlet, per the IPDS routing rules.
-const IP_ROUTING_FIELDS = {
-  productType: '_usgs_producttype_value',
-  interpretiveContent: 'usgs_interpretivecontent',
-  specialProductAlert: 'usgs_specialproductalert',
-  publicationOutletType: 'usgs_publicationoutlettype',
-  openAccess: 'usgs_openaccess',
-} as const
+// --- Workflow Group table + M:N relationship to Workflow Stage -------------
+// The relationship usgs_workflowgroup_usgs_workflowstage links Workflow Group
+// records to Workflow Stage records (confirmed topology). The group is keyed by
+// its number (usgs_workflowgroupnumber), so we find the group record whose
+// number matches the IP's, then $expand its related stages.
+const WORKFLOW_GROUP_ENTITY = 'usgs_workflowgroup' // TODO verify entity logical name
+const WORKFLOW_GROUP_ID_FIELD = 'usgs_workflowgroupid' // TODO verify primary-id logical name
+const WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_workflowgroupnumber' // the 1–7 number column ON the group entity (used to find the group by the IP's number)
+// Many-to-many relationship / navigation property linking a group to its stages.
+const GROUP_STAGE_MN_NAV = 'usgs_workflowgroup_usgs_workflowstage' // TODO verify it resolves as an $expand navigation property
 
-const IP_ROUTING_SELECT = Object.values(IP_ROUTING_FIELDS).join(',')
+// --- Workflow Stage fields (confirmed from the existing stage query) -------
+const WORKFLOW_STAGE_ID_FIELD = 'usgs_workflowstageid'
+const WORKFLOW_STAGE_NAME_FIELD = 'usgs_name' // TODO verify (matches existing usgs_workflowstage query)
+const WORKFLOW_STAGE_SEQUENCE_FIELD = 'usgs_sequencenumber' // TODO verify (matches existing usgs_workflowstage query)
 
-// Reads an option-set/lookup column as its display label when available, falling
-// back to the raw stored value.
-function readLabel(record: Record<string, unknown>, logicalName: string): string {
-  const formatted =
-    record[`${logicalName}@OData.Community.Display.V1.FormattedValue`]
-  return String(formatted ?? record[logicalName] ?? '')
-}
-
-// Reads an option-set column as its raw numeric value (null when absent).
+// Reads an option-set/numeric column as its raw numeric value (null when absent).
 function readOptionSetValue(
   record: Record<string, unknown>,
   logicalName: string,
@@ -302,162 +224,6 @@ function isTruthy(value: unknown): boolean {
 function addressCommentsParent(stageName: string): string | null {
   const match = stageName.match(/^(.*?)\s*-\s*address comments?$/i)
   return match ? match[1].trim() : null
-}
-
-// --- Group routing ---------------------------------------------------------
-// The routing inputs read off the IP record and normalized for determineGroup.
-type WorkflowInputs = {
-  productTypeLabel: string
-  // usgs_interpretivecontent: 1 = New interpretive (escalation trigger),
-  // 2 = previously approved, 3 = noninterpretive.
-  interpretiveContent: number | null
-  // usgs_specialproductalert: 0 = None; any non-zero = an alert is present
-  // (escalation trigger).
-  specialProductAlert: number | null
-  // usgs_publicationoutlettype: 1 = Science outlet, 2 = Non-scientific news media.
-  publicationOutletType: number | null
-  openAccess: boolean
-}
-
-function readWorkflowInputs(record: Record<string, unknown>): WorkflowInputs {
-  return {
-    productTypeLabel: readLabel(record, IP_ROUTING_FIELDS.productType),
-    interpretiveContent: readOptionSetValue(
-      record,
-      IP_ROUTING_FIELDS.interpretiveContent,
-    ),
-    specialProductAlert: readOptionSetValue(
-      record,
-      IP_ROUTING_FIELDS.specialProductAlert,
-    ),
-    publicationOutletType: readOptionSetValue(
-      record,
-      IP_ROUTING_FIELDS.publicationOutletType,
-    ),
-    openAccess: isTruthy(record[IP_ROUTING_FIELDS.openAccess]),
-  }
-}
-
-// Broad product-type buckets used by determineGroup. A single product type maps
-// to exactly one category; the routing conditions (escalation, open access,
-// outlet) then select the group within that category.
-type ProductCategory =
-  | 'simple' // low-content types: default Group 1
-  | 'standardPublication' // Atlas / Book / Map(non-USGS) / Thesis / etc.
-  | 'newsMedia' // news / media outlet types
-  | 'dataSoftware' // data / software / online resource: always Group 2
-  | 'journal' // Journal or periodical article
-  | 'usgsPublication' // USGS series / nonseries / Circular
-  | 'extramural' // Extramural-authored: Group 5
-  | 'alwaysBao' // Book review / Technical comment & reply / Preprint: Group 3
-
-// Exact product-type labels (lowercased) per category. Update these lists to
-// match the product-type option labels in the environment / IPDS spreadsheet.
-const PRODUCT_CATEGORY_LABELS: [ProductCategory, string[]][] = [
-  ['extramural', ['extramural-authored publication']],
-  [
-    'usgsPublication',
-    [
-      'usgs series publication',
-      'nonseries usgs publications',
-      'nonseries usgs publication',
-      'circular',
-    ],
-  ],
-  ['journal', ['journal or periodical article', 'journal article']],
-  ['alwaysBao', ['book review', 'technical comment and reply', 'preprint']],
-  [
-    'simple',
-    [
-      'abstract or summary',
-      'abstract/summary',
-      'poster or presentation',
-      'poster/presentation',
-      'usgs web page',
-    ],
-  ],
-  [
-    'dataSoftware',
-    [
-      'data release',
-      'software release',
-      'geonarrative',
-      'usgs-owned online database',
-      'usgs-owned online db',
-      'web data service',
-    ],
-  ],
-  [
-    'newsMedia',
-    ['news release', 'media interview', 'news/media', 'news or media'],
-  ],
-  [
-    'standardPublication',
-    [
-      'atlas',
-      'book',
-      'book chapter',
-      'map',
-      'thesis',
-      'dissertation',
-      'conference paper',
-      'pamphlet',
-      'professional paper',
-    ],
-  ],
-]
-
-function categorizeProductType(productTypeLabel: string): ProductCategory | null {
-  const label = productTypeLabel.trim().toLowerCase()
-  if (!label) {
-    return null
-  }
-  for (const [category, labels] of PRODUCT_CATEGORY_LABELS) {
-    if (labels.includes(label)) {
-      return category
-    }
-  }
-  return null
-}
-
-// Derives the workflow group (1–7) for an IP from its routing inputs, or null
-// when the product type can't be classified (unknown / unmapped types). The
-// caller renders GROUP_PATHS[group]; a null group falls back to showing only the
-// stages the record actually visited (no guessing).
-//
-// Escalation = new interpretive content OR any Special Product Alert; escalation
-// promotes a record to a group that includes BAO / additional review.
-function determineGroup(inputs: WorkflowInputs): number | null {
-  const category = categorizeProductType(inputs.productTypeLabel)
-  const escalated =
-    inputs.interpretiveContent === 1 ||
-    (inputs.specialProductAlert !== null && inputs.specialProductAlert !== 0)
-
-  switch (category) {
-    case 'extramural':
-      return 5
-    case 'usgsPublication':
-      return escalated ? 7 : 6
-    case 'journal':
-      // Open-access journal article → Group 3; not-open-access → Group 4.
-      return inputs.openAccess ? 3 : 4
-    case 'alwaysBao':
-      return 3
-    case 'simple':
-      // Low-content types default to Group 1 (peer review ignored in routing).
-      return 1
-    case 'dataSoftware':
-      // Data / software / online resources always route to Group 2.
-      return 2
-    case 'standardPublication':
-      // Standard publications: escalated → Group 3 (BAO), else Group 2.
-      return escalated ? 3 : 2
-    case 'newsMedia':
-      // News/media: escalated or scientific outlet → Group 3, else Group 1.
-      return escalated || inputs.publicationOutletType === 1 ? 3 : 1
-    default:
-      return null
-  }
 }
 
 function buildStagesQuery(workflowId: string): string {
@@ -826,7 +592,7 @@ async function fetchRecordWorkflow(): Promise<{
   stageId?: string
   workflowId?: string
   groupNumber?: number | null
-  groupPath?: string[] | null
+  groupStageIds?: string[] | null
   isLegacy?: boolean
 }> {
   const xrm = getXrmContext()
@@ -862,58 +628,124 @@ async function fetchRecordWorkflow(): Promise<{
       }
     }
 
-    const { groupNumber, groupPath } = await fetchGroupPath(xrm, formContext)
+    const { groupNumber, groupStageIds } = await fetchGroupStageIds(xrm, formContext)
 
-    return { stageId, workflowId, groupNumber, groupPath, isLegacy }
+    return { stageId, workflowId, groupNumber, groupStageIds, isLegacy }
   } catch {
     return {}
   }
 }
 
-// Reads the IP record's routing fields and derives its workflow group + the
-// ordered stage path to display. Kept in a separate, independently-guarded
-// request so that a bad field binding only disables path selection — the stage
-// list still renders. Returns nulls on failure / unknown product type, which
-// drives the "visited only" fallback in buildOrderedDisplay.
-async function fetchGroupPath(
+// One row of the M:N-expanded group→stage set (only the fields we select).
+type GroupStageRow = Record<string, unknown> & {
+  [WORKFLOW_STAGE_ID_FIELD]?: string
+  [WORKFLOW_STAGE_SEQUENCE_FIELD]?: number
+}
+
+// Reads the IP's Workflow Group number (usgs_workflowgroupnumber — a whole
+// number, 1–7). Null when no group is assigned or the field can't be read.
+async function readWorkflowGroupNumber(
   xrm: XrmContext,
   formContext: FormContext,
-): Promise<{ groupNumber: number | null; groupPath: string[] | null }> {
+): Promise<number | null> {
   try {
     const record = await xrm.WebApi.retrieveRecord(
       formContext.entityName,
       formContext.recordId,
-      `?$select=${IP_ROUTING_SELECT}`,
+      `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}`,
     )
-
-    const inputs = readWorkflowInputs(record)
-    const groupNumber = determineGroup(inputs)
-    const groupPath = groupNumber ? GROUP_PATHS[groupNumber] ?? null : null
-
-    // --- Routing diagnostics --------------------------------------------------
-    // Logs every object the routing pipeline consumes/produces so the group
-    // decision can be traced in the browser console. One collapsible entry.
-    console.groupCollapsed('[WorkflowVisualizer] group routing')
-    console.log('formContext', formContext)
-    console.log('routing fields ($select)', IP_ROUTING_SELECT.split(','))
-    const rawFields: Record<string, unknown> = {}
-    for (const logicalName of Object.values(IP_ROUTING_FIELDS)) {
-      rawFields[logicalName] = record[logicalName]
-      const formattedKey = `${logicalName}@OData.Community.Display.V1.FormattedValue`
-      if (formattedKey in record) {
-        rawFields[formattedKey] = record[formattedKey]
-      }
-    }
-    console.log('raw routing fields off record', rawFields)
-    console.log('normalized inputs', inputs)
-    console.log('resolved group', groupNumber)
-    console.log('group path', groupPath)
-    console.groupEnd()
-
-    return { groupNumber, groupPath }
+    return readOptionSetValue(record, IP_WORKFLOW_GROUP_NUMBER_FIELD)
   } catch (error) {
-    console.warn('[WorkflowVisualizer] group routing failed', error)
-    return { groupNumber: null, groupPath: null }
+    console.warn('[WorkflowVisualizer] failed to read workflow group number', error)
+    return null
+  }
+}
+
+// Sorts M:N-expanded stage rows by sequence number and returns their stage IDs
+// (lowercased) — the ordered display path.
+function toOrderedStageIds(related: GroupStageRow[]): string[] {
+  return related
+    .filter((row) => row[WORKFLOW_STAGE_ID_FIELD])
+    .sort(
+      (left, right) =>
+        (left[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0) -
+        (right[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? 0),
+    )
+    .map((row) => String(row[WORKFLOW_STAGE_ID_FIELD]).toLowerCase())
+}
+
+// Returns the ordered list of stage IDs (lowercased) for the IP's Workflow Group
+// via the many-to-many relationship, sorted by sequence number — the record's
+// display path. groupStageIds is null when no group / no related stages, which
+// drives the "visited only" fallback + no-group notice. Independently guarded so
+// a bad binding only disables path selection; the stage list still renders from
+// task history.
+//
+// Primary path (confirmed topology): the relationship links a usgs_workflowgroup
+// record (keyed by usgs_workflowgroupnumber) to its stages, so we find the group
+// record for the IP's number and $expand its stages. Safety net (in case the
+// relationship is actually defined on the Information Product): $expand the same
+// navigation property on the IP record itself. The console logs show which path
+// produced stages, so a wrong schema name is easy to spot.
+async function fetchGroupStageIds(
+  xrm: XrmContext,
+  formContext: FormContext,
+): Promise<{ groupNumber: number | null; groupStageIds: string[] | null }> {
+  const groupNumber = await readWorkflowGroupNumber(xrm, formContext)
+
+  console.groupCollapsed('[WorkflowVisualizer] workflow group')
+  console.log('IP workflow group number', groupNumber)
+
+  // Primary — resolve the group record by its number and expand its M:N stages.
+  if (groupNumber !== null) {
+    try {
+      const groups = await xrm.WebApi.retrieveMultipleRecords(
+        WORKFLOW_GROUP_ENTITY,
+        `?$select=${WORKFLOW_GROUP_ID_FIELD}` +
+          `&$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})` +
+          `&$filter=${WORKFLOW_GROUP_NUMBER_FIELD} eq ${groupNumber}`,
+      )
+      const groupRecord = groups.entities[0] as Record<string, unknown> | undefined
+      const related =
+        (groupRecord?.[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
+      console.log('group-table path: related stages', related)
+      const ids = toOrderedStageIds(related)
+      if (ids.length > 0) {
+        console.log('ordered group stage ids (group-table path)', ids)
+        console.groupEnd()
+        return { groupNumber, groupStageIds: ids }
+      }
+    } catch (error) {
+      console.warn(
+        '[WorkflowVisualizer] group-table path failed; trying IP-side expand',
+        error,
+      )
+    }
+  }
+
+  // Safety net — expand the relationship directly on the Information Product.
+  try {
+    const record = await xrm.WebApi.retrieveRecord(
+      formContext.entityName,
+      formContext.recordId,
+      `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}` +
+        `&$expand=${GROUP_STAGE_MN_NAV}($select=${WORKFLOW_STAGE_ID_FIELD},${WORKFLOW_STAGE_NAME_FIELD},${WORKFLOW_STAGE_SEQUENCE_FIELD})`,
+    )
+    const related = (record[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
+    console.log('IP-side path: related stages', related)
+    const ids = toOrderedStageIds(related)
+    console.log('ordered group stage ids (IP-side path)', ids)
+    console.groupEnd()
+    return { groupNumber, groupStageIds: ids.length > 0 ? ids : null }
+  } catch (error) {
+    // Requirement 3: don't crash when no group / no stages. The caller shows a
+    // notice; the stepper still renders whatever the task history yields.
+    console.warn(
+      '[WorkflowVisualizer] No workflow group stages could be resolved for this Information Product.',
+      error,
+    )
+    console.groupEnd()
+    return { groupNumber, groupStageIds: null }
   }
 }
 
@@ -949,37 +781,35 @@ function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): 
 }
 
 // Builds the ordered list of stages to DISPLAY for a record. Places the stages
-// named in the record's workflow-group path in order (each stage at most once,
-// so a stage the record revisited still appears only once). Then grafts in the
-// off-path stages the record actually landed on (visited / current) — primarily
-// comment-reconciliation ("<Approval> - Address Comments") stages, which are NOT
-// part of any group path and appear ONLY when the record was routed through
-// them, positioned immediately after their parent approval stage. When the group
-// can't be determined (groupPath null), nothing is pre-placed and only the
-// visited/current stages show — the visualizer never guesses a path.
+// belonging to the record's Workflow Group (from the M:N relationship) in their
+// sequence order, matched by stage ID (each stage at most once, so a stage the
+// record revisited still appears only once). Then grafts in the off-path stages
+// the record actually landed on (visited / current) — primarily comment-
+// reconciliation ("<Approval> - Address Comments") stages, which are NOT part of
+// a group's stage set and appear ONLY when the record was routed through them,
+// positioned immediately after their parent approval stage. When no group is
+// assigned (groupStageIds null), nothing is pre-placed and only the visited/
+// current stages show — the visualizer never guesses a path.
 function buildOrderedDisplay(
   stages: WorkflowStage[],
-  groupPath: string[] | null,
+  groupStageIds: string[] | null,
   currentStage: WorkflowStage | undefined,
   visited: (stage: WorkflowStage) => boolean,
 ): WorkflowStage[] {
-  const byName = new Map<string, WorkflowStage>()
+  const byId = new Map<string, WorkflowStage>()
   for (const stage of stages) {
-    const key = stage.stageName.toLowerCase()
-    if (!byName.has(key)) {
-      byName.set(key, stage)
-    }
+    byId.set(stage.id.toLowerCase(), stage)
   }
 
   const currentNameLower = currentStage?.stageName.toLowerCase()
   const placed: WorkflowStage[] = []
   const placedIds = new Set<string>()
 
-  // 1. Place the group-path stages in their defined order (deduped by id, so a
+  // 1. Place the group's stages in their sequence order (deduped by id, so a
   //    revisited stage still shows once).
-  if (groupPath) {
-    for (const name of groupPath) {
-      const stage = byName.get(name.toLowerCase())
+  if (groupStageIds) {
+    for (const stageId of groupStageIds) {
+      const stage = byId.get(stageId)
       if (!stage || placedIds.has(stage.id)) {
         continue
       }
@@ -1038,30 +868,37 @@ function buildOrderedDisplay(
 
 function buildStageViewModels(
   stages: WorkflowStage[],
-  currentSequence: number | null,
+  currentStageId: string | null,
   completionByStage: Map<string, string>,
   taskDetailByStage: Map<string, TaskDetail>,
   visitedStages: Set<string>,
-  groupPath: string[] | null,
+  groupStageIds: string[] | null,
   isLegacy: boolean,
 ): StageViewModel[] {
   const visited = (stage: WorkflowStage) => visitedStages.has(stage.id.toLowerCase())
+  // Match by stage ID (GUID), NOT usgs_sequencenumber: the shared stage catalog
+  // can have multiple rows with the same sequence number (this is common for
+  // "Address Comments" reconciliation stages, whose sequence numbers don't line
+  // up with the approval stages they follow). Matching by sequence risked
+  // resolving to the wrong stage of that name and grafting the wrong
+  // reconciliation stage into the display.
   const isCurrent = (stage: WorkflowStage) =>
-    currentSequence !== null && stage.sequenceNumber === currentSequence
+    currentStageId !== null && stage.id.toLowerCase() === currentStageId
   const currentStage = stages.find(isCurrent)
 
   console.groupCollapsed('[WorkflowVisualizer] buildStageViewModels')
-  console.log('input: currentSequence', currentSequence)
+  console.log('input: currentStageId', currentStageId)
   console.log('input: currentStage', currentStage?.stageName)
   console.log('input: visitedStages', [...visitedStages])
-  console.log('input: groupPath', groupPath)
+  console.log('input: groupStageIds', groupStageIds)
   console.log('input: isLegacy', isLegacy)
 
-  // Decide which stages to display, and in what order: the record's workflow
-  // group path plus any reconciliation stages it was actually routed through.
-  // Legacy records use the same group path (per AC — show the standard path for
-  // the group; don't reconstruct missing history).
-  const display = buildOrderedDisplay(stages, groupPath, currentStage, visited)
+  // Decide which stages to display, and in what order: the record's Workflow
+  // Group stages (from the M:N relationship) plus any reconciliation stages it
+  // was actually routed through. Legacy records use the same group stages (per
+  // AC — show the standard path for the group; don't reconstruct missing
+  // history).
+  const display = buildOrderedDisplay(stages, groupStageIds, currentStage, visited)
 
   // Status is positional within the display list — NOT global sequence.
   const currentIndex = display.findIndex(isCurrent)
@@ -1206,7 +1043,7 @@ function App() {
   const [loadState, setLoadState] = useState<LoadState>('loading')
   const [sourceLabel, setSourceLabel] = useState('Loading workflow stages.')
   const stages = useMemo(() => normalizeWorkflowStages(rows), [rows])
-  const [currentSequence, setCurrentSequence] = useState<number | null>(null)
+  const [currentStageId, setCurrentStageId] = useState<string | null>(null)
   const [currentWorkflowId, setCurrentWorkflowId] = useState<string | null>(null)
   const [completionByStage, setCompletionByStage] = useState<Map<string, string>>(
     () => new Map(),
@@ -1215,7 +1052,7 @@ function App() {
     () => new Map(),
   )
   const [visitedStages, setVisitedStages] = useState<Set<string>>(() => new Set())
-  const [groupPath, setGroupPath] = useState<string[] | null>(null)
+  const [groupStageIds, setGroupStageIds] = useState<string[] | null>(null)
   const [groupNumber, setGroupNumber] = useState<number | null>(null)
   const [isLegacy, setIsLegacy] = useState(false)
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(() => new Set())
@@ -1254,7 +1091,7 @@ function App() {
           stageId,
           workflowId,
           groupNumber: nextGroupNumber,
-          groupPath: nextGroupPath,
+          groupStageIds: nextGroupStageIds,
           isLegacy: nextIsLegacy,
         },
         taskHistory,
@@ -1282,19 +1119,12 @@ function App() {
         return
       }
 
-      const currentRow = stageId
-        ? nextRows.find(
-            (row) =>
-              row.usgs_workflowstageid?.toLowerCase() === stageId.toLowerCase(),
-          )
-        : undefined
-
       setRows(nextRows)
-      setCurrentSequence(currentRow?.usgs_sequencenumber ?? null)
+      setCurrentStageId(stageId ? stageId.toLowerCase() : null)
       setCompletionByStage(taskHistory.completionByStage)
       setTaskDetailByStage(taskHistory.taskDetailByStage)
       setVisitedStages(taskHistory.visitedStages)
-      setGroupPath(nextGroupPath ?? null)
+      setGroupStageIds(nextGroupStageIds ?? null)
       setGroupNumber(nextGroupNumber ?? null)
       setIsLegacy(nextIsLegacy ?? false)
       setSourceLabel(source)
@@ -1357,17 +1187,17 @@ function App() {
     () =>
       buildStageViewModels(
         stages,
-        currentSequence,
+        currentStageId,
         completionByStage,
         taskDetailByStage,
         visitedStages,
-        groupPath,
+        groupStageIds,
         isLegacy,
       ),
-    [stages, currentSequence, completionByStage, taskDetailByStage, visitedStages, groupPath, isLegacy],
+    [stages, currentStageId, completionByStage, taskDetailByStage, visitedStages, groupStageIds, isLegacy],
   )
 
-  const currentStage = stages.find((stage) => stage.sequenceNumber === currentSequence)
+  const currentStage = stages.find((stage) => stage.id.toLowerCase() === currentStageId)
 
   return (
     <main className="appShell">
@@ -1407,6 +1237,17 @@ function App() {
             <h3>Unable to load workflow stages</h3>
             <p>{sourceLabel}</p>
           </div>
+        )}
+
+        {loadState === 'ready' && groupStageIds === null && (
+          <p
+            className="workflowNotice"
+            role="status"
+            style={{ margin: '16px 24px 0', color: 'var(--muted)', fontSize: 13 }}
+          >
+            No workflow group is assigned to this Information Product. Showing
+            stages from task history only.
+          </p>
         )}
 
         {loadState !== 'error' && (

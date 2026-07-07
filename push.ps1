@@ -2,7 +2,7 @@
 npm run build
 
 # 2. Read index.html
-$indexPath = Join-Path (Resolve-Path "./build") "index.html"
+$indexPath = Join-Path (Resolve-Path "./dist") "index.html"
 $htmlContent = Get-Content $indexPath -Raw
 
 # 3. Convert to Base64 (Dataverse requires this)
@@ -16,7 +16,7 @@ $token = Get-MsalToken -Scopes "$environmentUrl/.default" -Interactive
 $accessToken = $token.AccessToken
 
 # 6. Get the web resource
-$webResourceName = "new_mywebresource.html"
+$webResourceName = "usgs_bpfproto_1.html"
 $lookupUrl = "$environmentUrl/api/data/v9.2/webresourceset?$filter=name eq '$webResourceName'"
 
 $wr = Invoke-RestMethod -Method Get -Uri $lookupUrl -Headers @{
