@@ -147,13 +147,15 @@ const SIDE_PANE_ID = 'WorkflowVisualizationPane'
 // Deployment configuration — adjust to match the Dataverse schema and data.
 // ---------------------------------------------------------------------------
 
-// Logical (schema) name of the "requested due date" column on usgs_workflowtask.
-// Change this if the column is named differently in your environment.
-const TASK_DUE_DATE_FIELD = 'usgs_requestedduedatefornexttask'
+// Logical (schema) name of the due-date column on usgs_workflowtask — the
+// CURRENT task's own due date (schema/display name "usgs_DueDate"; Dataverse
+// column logical names are always lowercase). Shown on the stage the active
+// task belongs to — NOT mapped forward to any other stage.
+const TASK_DUE_DATE_FIELD = 'usgs_duedate'
 
 // How often (ms) to silently re-fetch so task updates appear without a manual
 // reload. Also exposed as window.refreshWorkflowVisualizer() for the host form.
-const REFRESH_INTERVAL_MS = 30000
+const REFRESH_INTERVAL_MS = 10000
 
 // ---------------------------------------------------------------------------
 // Workflow group → stages (dynamic, from Dataverse — NOT hard-coded).
@@ -447,30 +449,12 @@ function formatDate(value: string | null | undefined): string | undefined {
   return year && month && day ? `${month}/${day}/${year}` : undefined
 }
 
-// Merges a due date into a stage's task detail without discarding whatever is
-// already recorded there (e.g. that stage's own assignee from being currently
-// active). taskId is required by TaskDetail, so an entry created here falls
-// back to the task that supplied the due date.
-function attachDueDateToStage(
-  taskDetailByStage: Map<string, TaskDetail>,
-  stageKey: string,
-  dueDate: string,
-  fallbackTaskId: string,
-): void {
-  const existing = taskDetailByStage.get(stageKey)
-  taskDetailByStage.set(stageKey, {
-    ...(existing ?? { taskId: fallbackTaskId }),
-    dueDate,
-  })
-}
-
 // Reads all tasks for this record to reconstruct the path it actually took.
 // Finalized tasks (statuscode 2) populate completionByStage, visitedStages, and
 // taskDetailByStage. Active tasks (any other statuscode) populate taskDetailByStage
-// for the in-progress stage so the assignee is visible there too. The
-// "Requested Due Date" field is named "for next task" — it describes the
-// UPCOMING (to) stage's work, not the stage the task is completing — so it is
-// attached to the to-stage's detail, never the from-stage's.
+// for the in-progress stage so the assignee AND that task's own due date are
+// visible there. The due date is never mapped to a different stage — it always
+// describes the task's own (current) stage.
 async function fetchTaskHistory(): Promise<{
   completionByStage: Map<string, string>
   taskDetailByStage: Map<string, TaskDetail>
@@ -569,20 +553,16 @@ async function fetchTaskHistory(): Promise<{
             ownerId,
             ownerEntityType,
             // No dueDate here: this stage's task is done, so its due date is
-            // stale — the due date belongs to the to-stage (see below).
+            // no longer relevant — due dates only apply to the active task.
           })
           console.log('  recorded completion for from-stage', key, { completedDate, ownerName })
         } else {
           console.log('  kept existing (newer) completion for from-stage', key, { existing, thisDate: completedDate })
         }
-
-        if (dueDate) {
-          attachDueDateToStage(taskDetailByStage, toStageId.toLowerCase(), dueDate, taskId)
-          console.log('  attached due date to upcoming (to) stage', toStageId.toLowerCase(), dueDate)
-        }
       } else {
-        // Active task: show assignee on the in-progress (from) stage.
-        // Finalized task for the same From stage (if any) takes precedence.
+        // Active task: show assignee and this task's own due date on the
+        // in-progress (from) stage. Finalized task for the same From stage
+        // (if any) takes precedence.
         if (!completionByStage.has(key)) {
           taskDetailByStage.set(key, {
             taskId,
@@ -590,16 +570,11 @@ async function fetchTaskHistory(): Promise<{
             ownerName,
             ownerId,
             ownerEntityType,
+            dueDate,
           })
-          console.log('  active task — recorded assignee detail for stage', key, { ownerName, statuscode: task.statuscode })
+          console.log('  active task — recorded assignee + due date for stage', key, { ownerName, dueDate, statuscode: task.statuscode })
         } else {
           console.log('  active task — skipped, finalized completion already exists for stage', key)
-        }
-
-        const toStageId = asGuid(task._usgs_workflowstageto_value)
-        if (toStageId && dueDate) {
-          attachDueDateToStage(taskDetailByStage, toStageId.toLowerCase(), dueDate, taskId)
-          console.log('  active task — attached due date to upcoming (to) stage', toStageId.toLowerCase(), dueDate)
         }
       }
     }
