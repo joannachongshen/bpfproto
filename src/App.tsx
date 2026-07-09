@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
-type StageStatus = 'completed' | 'inProgress' | 'upcoming' | 'returned'
+type StageStatus = 'completed' | 'inProgress' | 'upcoming'
 
 type LoadState = 'loading' | 'ready' | 'error'
 
@@ -102,6 +102,9 @@ type XrmUtility = {
   getPageContext?: () => {
     input?: { pageType?: string; entityName?: string; entityId?: string }
   } | undefined
+  getGlobalContext?: () => {
+    getClientUrl?: () => string
+  }
 }
 
 // Form context exposed by the host page when this resource is embedded directly
@@ -178,15 +181,25 @@ const IP_WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_workflowgroupnumber'
 
 // --- Workflow Group table + M:N relationship to Workflow Stage -------------
 // The relationship usgs_workflowgroup_usgs_workflowstage links Workflow Group
-// records to Workflow Stage records (confirmed topology). The group is keyed by
-// its number (usgs_workflowgroupnumber), so we find the group record whose
-// number matches the IP's, then $expand its related stages.
+// records to Workflow Stage records (confirmed topology, smueller 2026-07-06).
+// We find the group record whose number matches the IP's, then $expand its
+// related stages. IMPORTANT: the group NUMBER column has DIFFERENT logical names
+// on the two tables — on the Information Product it is `usgs_workflowgroupnumber`
+// (IP_WORKFLOW_GROUP_NUMBER_FIELD above), but on the Workflow Group table it is
+// `usgs_groupnumber` (below). Filtering the group table on the wrong one returns
+// no group record and therefore no stages.
 const WORKFLOW_GROUP_ENTITY = 'usgs_workflowgroup' // TODO verify entity logical name
-const WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_workflowgroupnumber' // the 1–7 number column ON the group entity (used to find the group by the IP's number)
-// Many-to-many relationship / navigation property linking a group to its stages.
-const GROUP_STAGE_MN_NAV = 'usgs_workflowgroup_usgs_workflowstage' // TODO verify it resolves as an $expand navigation property
+const WORKFLOW_GROUP_NUMBER_FIELD = 'usgs_groupnumber' // the 1–7 number column ON the group table (confirmed smueller 2026-07-06)
+// Many-to-many navigation property linking a group to its stages. NOTE the
+// Pascal-cased W's: the $expand navigation-property name is case-sensitive and
+// is `usgs_WorkflowGroup_usgs_WorkflowStage` (confirmed via RelationshipDefinitions
+// metadata, smueller 2026-07-06) — DISTINCT from the all-lowercase intersect
+// entity name `usgs_workflowgroup_usgs_workflowstage`. Both nav-property sides
+// (from group and from stage) use this same name.
+const GROUP_STAGE_MN_NAV = 'usgs_WorkflowGroup_usgs_WorkflowStage'
 
 // --- Workflow Stage fields (confirmed from the existing stage query) -------
+const WORKFLOW_STAGE_ENTITY = 'usgs_workflowstage'
 const WORKFLOW_STAGE_ID_FIELD = 'usgs_workflowstageid'
 const WORKFLOW_STAGE_NAME_FIELD = 'usgs_name' // TODO verify (matches existing usgs_workflowstage query)
 const WORKFLOW_STAGE_SEQUENCE_FIELD = 'usgs_sequencenumber' // TODO verify (matches existing usgs_workflowstage query)
@@ -230,7 +243,6 @@ const statusContent: Record<StageStatus, { label: string; icon: string }> = {
   completed: { label: 'Completed', icon: 'check' },
   inProgress: { label: 'In progress', icon: 'progress' },
   upcoming: { label: 'Upcoming', icon: 'upcoming' },
-  returned: { label: 'Needs attention', icon: 'attention' },
 }
 
 function getXrmContext(): XrmContext | undefined {
@@ -435,10 +447,30 @@ function formatDate(value: string | null | undefined): string | undefined {
   return year && month && day ? `${month}/${day}/${year}` : undefined
 }
 
+// Merges a due date into a stage's task detail without discarding whatever is
+// already recorded there (e.g. that stage's own assignee from being currently
+// active). taskId is required by TaskDetail, so an entry created here falls
+// back to the task that supplied the due date.
+function attachDueDateToStage(
+  taskDetailByStage: Map<string, TaskDetail>,
+  stageKey: string,
+  dueDate: string,
+  fallbackTaskId: string,
+): void {
+  const existing = taskDetailByStage.get(stageKey)
+  taskDetailByStage.set(stageKey, {
+    ...(existing ?? { taskId: fallbackTaskId }),
+    dueDate,
+  })
+}
+
 // Reads all tasks for this record to reconstruct the path it actually took.
 // Finalized tasks (statuscode 2) populate completionByStage, visitedStages, and
 // taskDetailByStage. Active tasks (any other statuscode) populate taskDetailByStage
-// for the in-progress stage so the assignee is visible there too.
+// for the in-progress stage so the assignee is visible there too. The
+// "Requested Due Date" field is named "for next task" — it describes the
+// UPCOMING (to) stage's work, not the stage the task is completing — so it is
+// attached to the to-stage's detail, never the from-stage's.
 async function fetchTaskHistory(): Promise<{
   completionByStage: Map<string, string>
   taskDetailByStage: Map<string, TaskDetail>
@@ -536,15 +568,21 @@ async function fetchTaskHistory(): Promise<{
             ownerName,
             ownerId,
             ownerEntityType,
-            dueDate,
+            // No dueDate here: this stage's task is done, so its due date is
+            // stale — the due date belongs to the to-stage (see below).
           })
-          console.log('  recorded completion for from-stage', key, { completedDate, ownerName, dueDate })
+          console.log('  recorded completion for from-stage', key, { completedDate, ownerName })
         } else {
           console.log('  kept existing (newer) completion for from-stage', key, { existing, thisDate: completedDate })
         }
+
+        if (dueDate) {
+          attachDueDateToStage(taskDetailByStage, toStageId.toLowerCase(), dueDate, taskId)
+          console.log('  attached due date to upcoming (to) stage', toStageId.toLowerCase(), dueDate)
+        }
       } else {
-        // Active task: show assignee on the in-progress stage. Finalized task
-        // for the same From stage (if any) takes precedence.
+        // Active task: show assignee on the in-progress (from) stage.
+        // Finalized task for the same From stage (if any) takes precedence.
         if (!completionByStage.has(key)) {
           taskDetailByStage.set(key, {
             taskId,
@@ -552,11 +590,16 @@ async function fetchTaskHistory(): Promise<{
             ownerName,
             ownerId,
             ownerEntityType,
-            dueDate,
           })
-          console.log('  active task — recorded assignee detail for stage', key, { ownerName, dueDate, statuscode: task.statuscode })
+          console.log('  active task — recorded assignee detail for stage', key, { ownerName, statuscode: task.statuscode })
         } else {
           console.log('  active task — skipped, finalized completion already exists for stage', key)
+        }
+
+        const toStageId = asGuid(task._usgs_workflowstageto_value)
+        if (toStageId && dueDate) {
+          attachDueDateToStage(taskDetailByStage, toStageId.toLowerCase(), dueDate, taskId)
+          console.log('  active task — attached due date to upcoming (to) stage', toStageId.toLowerCase(), dueDate)
         }
       }
     }
@@ -655,6 +698,18 @@ type GroupStageRow = Record<string, unknown> & {
   [WORKFLOW_STAGE_DESCRIPTION_FIELD]?: string
 }
 
+type ManyToManyRelationshipMetadata = {
+  SchemaName?: string
+  Entity1LogicalName?: string
+  Entity2LogicalName?: string
+  Entity1NavigationPropertyName?: string
+  Entity2NavigationPropertyName?: string
+}
+
+type ManyToManyRelationshipResponse = {
+  value?: ManyToManyRelationshipMetadata[]
+}
+
 // The columns selected on each M:N-related stage (also used by the IP-side
 // safety-net query). Enough to render the stage directly — no separate catalog
 // fetch is required for the group's own stages.
@@ -664,6 +719,86 @@ const GROUP_STAGE_SELECT = [
   WORKFLOW_STAGE_SEQUENCE_FIELD,
   WORKFLOW_STAGE_DESCRIPTION_FIELD,
 ].join(',')
+
+function getClientUrl(xrm: XrmContext): string | null {
+  const direct = xrm.Utility?.getGlobalContext?.().getClientUrl?.()
+  if (direct) {
+    return direct.replace(/\/$/, '')
+  }
+
+  try {
+    const hostUrl = window.parent?.Xrm?.Utility?.getGlobalContext?.().getClientUrl?.()
+    return hostUrl ? hostUrl.replace(/\/$/, '') : null
+  } catch {
+    return null
+  }
+}
+
+async function fetchGroupStageNavigationCandidates(xrm: XrmContext): Promise<string[]> {
+  const clientUrl = getClientUrl(xrm)
+  if (!clientUrl) {
+    console.log('[WorkflowVisualizer] unable to read client URL; using default relationship navigation name')
+    return [GROUP_STAGE_MN_NAV]
+  }
+
+  const query =
+    `${clientUrl}/api/data/v9.2/EntityDefinitions(LogicalName='${WORKFLOW_GROUP_ENTITY}')` +
+    '/ManyToManyRelationships' +
+    '?$select=SchemaName,Entity1LogicalName,Entity2LogicalName,Entity1NavigationPropertyName,Entity2NavigationPropertyName'
+
+  try {
+    const response = await fetch(query, {
+      headers: {
+        Accept: 'application/json',
+        'OData-MaxVersion': '4.0',
+        'OData-Version': '4.0',
+      },
+    })
+
+    if (!response.ok) {
+      console.warn(
+        '[WorkflowVisualizer] relationship metadata lookup failed; using default relationship navigation name',
+        response.status,
+        response.statusText,
+      )
+      return [GROUP_STAGE_MN_NAV]
+    }
+
+    const payload = (await response.json()) as ManyToManyRelationshipResponse
+    const matches =
+      payload.value?.filter((relationship) => {
+        const schemaMatches = relationship.SchemaName === GROUP_STAGE_MN_NAV
+        const linksWorkflowStage =
+          relationship.Entity1LogicalName === WORKFLOW_STAGE_ENTITY ||
+          relationship.Entity2LogicalName === WORKFLOW_STAGE_ENTITY
+        return schemaMatches || linksWorkflowStage
+      }) ?? []
+
+    const candidates = new Set<string>([GROUP_STAGE_MN_NAV])
+    for (const relationship of matches) {
+      if (relationship.Entity1NavigationPropertyName) {
+        candidates.add(relationship.Entity1NavigationPropertyName)
+      }
+      if (relationship.Entity2NavigationPropertyName) {
+        candidates.add(relationship.Entity2NavigationPropertyName)
+      }
+    }
+
+    const resolved = [...candidates]
+    console.log('[WorkflowVisualizer] group-stage navigation candidates', {
+      relationshipSchema: GROUP_STAGE_MN_NAV,
+      candidates: resolved,
+      metadataMatches: matches,
+    })
+    return resolved
+  } catch (error) {
+    console.warn(
+      '[WorkflowVisualizer] relationship metadata lookup failed; using default relationship navigation name',
+      error,
+    )
+    return [GROUP_STAGE_MN_NAV]
+  }
+}
 
 // Reads the IP's Workflow Group number (usgs_workflowgroupnumber — a whole
 // number, 1–7). Null when no group is assigned or the field can't be read.
@@ -717,6 +852,38 @@ function groupRowsToStages(related: GroupStageRow[]): WorkflowStage[] {
   return sorted
 }
 
+function logWorkflowGroupStageFetch(
+  formContext: FormContext,
+  source: 'group-table path' | 'IP-side path',
+  groupNumber: number | null,
+  navigationProperty: string,
+  related: GroupStageRow[],
+  groupRecord?: Record<string, unknown>,
+): void {
+  console.log('[WorkflowVisualizer] Information Product workflow group stage fetch', {
+    informationProduct: {
+      entityName: formContext.entityName,
+      recordId: formContext.recordId,
+    },
+    workflowGroup: {
+      number: groupNumber,
+      id:
+        groupRecord?.usgs_workflowgroupid ??
+        groupRecord?.[`${WORKFLOW_GROUP_ENTITY}id`] ??
+        null,
+      name: groupRecord?.usgs_name ?? null,
+    },
+    relationshipSchema: GROUP_STAGE_MN_NAV,
+    navigationProperty,
+    source,
+    fetchedStages: related.map((stage) => ({
+      id: stage[WORKFLOW_STAGE_ID_FIELD] ?? null,
+      name: stage[WORKFLOW_STAGE_NAME_FIELD] ?? null,
+      sequenceNumber: stage[WORKFLOW_STAGE_SEQUENCE_FIELD] ?? null,
+    })),
+  })
+}
+
 // Returns the IP's Workflow Group number + the group's ordered stages (as
 // WorkflowStage objects) from the many-to-many relationship, sorted by sequence
 // number — the record's display path. This is the SOLE driver of the path:
@@ -740,74 +907,104 @@ async function fetchGroupStages(
 
   console.groupCollapsed('[WorkflowVisualizer] workflow group')
   console.log('IP workflow group number', groupNumber)
+  const navigationCandidates = await fetchGroupStageNavigationCandidates(xrm)
 
   // Primary — resolve the group record by its number and expand its M:N stages.
   if (groupNumber !== null) {
-    const groupQuery =
-      `?$expand=${GROUP_STAGE_MN_NAV}($select=${GROUP_STAGE_SELECT})` +
-      `&$filter=${WORKFLOW_GROUP_NUMBER_FIELD} eq ${groupNumber}`
-    console.log('group-table path: entity', WORKFLOW_GROUP_ENTITY, 'query', groupQuery)
-    try {
-      const groups = await xrm.WebApi.retrieveMultipleRecords(
-        WORKFLOW_GROUP_ENTITY,
-        groupQuery,
-      )
-      console.log('group-table path: matching group records found', groups.entities.length)
-      const groupRecord = groups.entities[0] as Record<string, unknown> | undefined
-      console.log('group-table path: group record', groupRecord)
-      const related =
-        (groupRecord?.[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
-      console.log('group-table path: related stages (raw expand)', related)
-      const groupStages = groupRowsToStages(related)
-      if (groupStages.length > 0) {
-        console.log('group stages (group-table path) — SUCCESS', groupStages.map((s) => s.stageName))
-        console.groupEnd()
-        return { groupNumber, groupStages }
+    for (const navigationProperty of navigationCandidates) {
+      // usgs_groupnumber on the Workflow Group table is Edm.String server-side
+      // (confirmed via a live 400: "Edm.String and Edm.Int32... Equal") even
+      // though it holds digits — quote the literal as an OData string.
+      const groupQuery =
+        `?$expand=${navigationProperty}($select=${GROUP_STAGE_SELECT})` +
+        `&$filter=${WORKFLOW_GROUP_NUMBER_FIELD} eq '${groupNumber}'`
+      console.log('group-table path: entity', WORKFLOW_GROUP_ENTITY, 'query', groupQuery)
+      try {
+        const groups = await xrm.WebApi.retrieveMultipleRecords(
+          WORKFLOW_GROUP_ENTITY,
+          groupQuery,
+        )
+        console.log('group-table path: matching group records found', groups.entities.length)
+        const groupRecord = groups.entities[0] as Record<string, unknown> | undefined
+        console.log('group-table path: group record', groupRecord)
+        const related =
+          (groupRecord?.[navigationProperty] as GroupStageRow[] | undefined) ?? []
+        console.log('group-table path: related stages (raw expand)', related)
+        logWorkflowGroupStageFetch(
+          formContext,
+          'group-table path',
+          groupNumber,
+          navigationProperty,
+          related,
+          groupRecord,
+        )
+        const groupStages = groupRowsToStages(related)
+        if (groupStages.length > 0) {
+          console.log('group stages (group-table path) — SUCCESS', groupStages.map((s) => s.stageName))
+          console.groupEnd()
+          return { groupNumber, groupStages }
+        }
+        console.log(
+          'group-table path produced zero stages for navigation property',
+          navigationProperty,
+        )
+      } catch (error) {
+        console.warn(
+          '[WorkflowVisualizer] group-table path failed for navigation property',
+          navigationProperty,
+          error,
+        )
       }
-      console.log('group-table path produced zero stages; falling back to IP-side expand')
-    } catch (error) {
-      console.warn(
-        '[WorkflowVisualizer] group-table path failed; trying IP-side expand',
-        error,
-      )
     }
+    console.log('all group-table navigation candidates produced zero stages; falling back to IP-side expand')
   } else {
     console.log('no workflow group number on IP; skipping group-table path, trying IP-side expand')
   }
 
   // Safety net — expand the relationship directly on the Information Product.
-  const ipQuery =
-    `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}` +
-    `&$expand=${GROUP_STAGE_MN_NAV}($select=${GROUP_STAGE_SELECT})`
-  console.log('IP-side path: entity', formContext.entityName, 'query', ipQuery)
-  try {
-    const record = await xrm.WebApi.retrieveRecord(
-      formContext.entityName,
-      formContext.recordId,
-      ipQuery,
-    )
-    console.log('IP-side path: raw IP record', record)
-    const related = (record[GROUP_STAGE_MN_NAV] as GroupStageRow[] | undefined) ?? []
-    console.log('IP-side path: related stages (raw expand)', related)
-    const groupStages = groupRowsToStages(related)
-    console.log(
-      groupStages.length > 0
-        ? 'group stages (IP-side path) — SUCCESS'
-        : 'group stages (IP-side path) — EMPTY, both paths failed',
-      groupStages.map((s) => s.stageName),
-    )
-    console.groupEnd()
-    return { groupNumber, groupStages: groupStages.length > 0 ? groupStages : null }
-  } catch (error) {
-    // Requirement 3: don't crash when no group / no stages. The caller shows a
-    // notice; the stepper still renders whatever the task history yields.
-    console.warn(
-      '[WorkflowVisualizer] No workflow group stages could be resolved for this Information Product.',
-      error,
-    )
-    console.groupEnd()
-    return { groupNumber, groupStages: null }
+  for (const navigationProperty of navigationCandidates) {
+    const ipQuery =
+      `?$select=${IP_WORKFLOW_GROUP_NUMBER_FIELD}` +
+      `&$expand=${navigationProperty}($select=${GROUP_STAGE_SELECT})`
+    console.log('IP-side path: entity', formContext.entityName, 'query', ipQuery)
+    try {
+      const record = await xrm.WebApi.retrieveRecord(
+        formContext.entityName,
+        formContext.recordId,
+        ipQuery,
+      )
+      console.log('IP-side path: raw IP record', record)
+      const related = (record[navigationProperty] as GroupStageRow[] | undefined) ?? []
+      console.log('IP-side path: related stages (raw expand)', related)
+      logWorkflowGroupStageFetch(
+        formContext,
+        'IP-side path',
+        groupNumber,
+        navigationProperty,
+        related,
+      )
+      const groupStages = groupRowsToStages(related)
+      if (groupStages.length > 0) {
+        console.log('group stages (IP-side path) — SUCCESS', groupStages.map((s) => s.stageName))
+        console.groupEnd()
+        return { groupNumber, groupStages }
+      }
+    } catch (error) {
+      console.warn(
+        '[WorkflowVisualizer] IP-side path failed for navigation property',
+        navigationProperty,
+        error,
+      )
+    }
   }
+
+  // Requirement 3: don't crash when no group / no stages. The caller shows a
+  // notice; the stepper still renders whatever the task history yields.
+  console.warn(
+    '[WorkflowVisualizer] No workflow group stages could be resolved for this Information Product.',
+  )
+  console.groupEnd()
+  return { groupNumber, groupStages: null }
 }
 
 function normalizeWorkflowStages(rows: DataverseWorkflowStageRow[]): WorkflowStage[] {
@@ -983,12 +1180,11 @@ function buildStageViewModels(
   // history).
   const display = buildOrderedDisplay(stages, groupStageIds, currentStage, visited)
 
-  // Status is positional within the display list — NOT global sequence.
+  // Status is positional within the display list — NOT global sequence. A
+  // record sent back to an earlier stage simply shows that stage as in
+  // progress again (no separate "returned" state — matches the AC's 3-color
+  // scheme: completed / current / future only).
   const currentIndex = display.findIndex(isCurrent)
-  const maxVisitedIndex = display.reduce(
-    (max, stage, index) => (visited(stage) ? Math.max(max, index) : max),
-    -1,
-  )
 
   const result: StageViewModel[] = display.map((stage, index) => {
     let status: StageStatus
@@ -998,17 +1194,17 @@ function buildStageViewModels(
     } else if (index < currentIndex) {
       status = 'completed'
     } else if (index === currentIndex) {
-      // The record sits earlier than the furthest stage it reached => it was
-      // sent back here => "returned" (needs attention). Otherwise in progress.
-      // Legacy records skip this heuristic (visited history is unreliable).
-      status =
-        !isLegacy && currentIndex < maxVisitedIndex ? 'returned' : 'inProgress'
+      status = 'inProgress'
     } else {
       status = 'upcoming'
     }
 
     const key = stage.id.toLowerCase()
-    const taskDetail = status !== 'upcoming' ? taskDetailByStage.get(key) : undefined
+    // Task detail (assignee / requested due date / completed date) is shown
+    // whenever present, regardless of status — the "requested due date" in
+    // particular is attached to the UPCOMING stage's entry (see
+    // fetchTaskHistory), so it must not be excluded for upcoming stages.
+    const taskDetail = taskDetailByStage.get(key)
 
     return {
       ...stage,
@@ -1063,12 +1259,6 @@ function StatusIcon({ status }: { status: StageStatus }) {
       {iconType === 'upcoming' && (
         <svg viewBox="0 0 20 20" focusable="false">
           <path d="M10 4a6 6 0 1 0 0 12 6 6 0 0 0 0-12Zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8Z" />
-        </svg>
-      )}
-      {iconType === 'attention' && (
-        <svg viewBox="0 0 20 20" focusable="false">
-          <path d="M9 4h2v7H9z" />
-          <path d="M9 13.2h2v2.2H9z" />
         </svg>
       )}
     </span>
@@ -1315,7 +1505,7 @@ function App() {
   }, [loadStages])
 
   // The side pane has no "form close" event, so poll the app's main area every
-  // 5 seconds. The pane stays only while a usgs_informationproduct *record form*
+  // second. The pane stays only while a usgs_informationproduct *record form*
   // is open; navigating to its view/list, another entity, or no record at all
   // closes it. Reads the live main-window URL rather than the stale Xrm.Page.
   useEffect(() => {
@@ -1323,7 +1513,7 @@ function App() {
       if (!isOnInformationProductRecord()) {
         closeWorkflowPane()
       }
-    }, 5000)
+    }, 1000)
 
     return () => window.clearInterval(intervalId)
   }, [])
@@ -1390,8 +1580,9 @@ function App() {
             role="status"
             style={{ margin: '16px 24px 0', color: 'var(--muted)', fontSize: 13 }}
           >
-            No workflow group is assigned to this Information Product. Showing
-            stages from task history only.
+            {groupNumber === null
+              ? 'No workflow group is assigned to this Information Product. Showing stages from task history only.'
+              : `Workflow group ${groupNumber} is assigned, but no related workflow stages were loaded. Showing stages from task history only.`}
           </p>
         )}
 
@@ -1403,8 +1594,9 @@ function App() {
           >
             {stageViewModels.map((stage) => {
               const isExpanded = expandedStageIds.has(stage.id)
+              // Only assignee, requested due date, and completed date are
+              // shown — stage descriptions are intentionally excluded.
               const hasDetails =
-                !!stage.description ||
                 !!stage.comment ||
                 !!stage.ownerName ||
                 !!stage.dueDate ||
@@ -1447,9 +1639,6 @@ function App() {
 
                     {isExpanded && hasDetails && (
                       <div className="stageDetails">
-                        {stage.description && (
-                          <p className="stageDescription">{stage.description}</p>
-                        )}
                         <div className="detailMeta">
                           <div className="detailMetaLeft">
                             {stage.ownerName && (
