@@ -11,11 +11,25 @@
   --canvas: #ffffff;
   --line: #d1d1d1;
   --focus: #005ea8;
-  /* AC color scheme: completed stages = blue #0072B2 */
+  /* DEFAULT THEME — client-requested blue-family scheme. WCAG 2.x contrast
+     passes cleanly (4.6-5.2:1 against white, comfortably above the 3:1 UI-
+     component minimum). KNOWN LIMITATION (confirmed via colorblindness
+     simulation, smueller 2026-07-06): --complete (#0072b2) and --progress
+     (#287aa9) are both blue and become hard to distinguish for users with
+     protanopia, deuteranopia, or tritanopia — simulated separation is well
+     below what the other 4 themes achieve. Decision: kept as-is per explicit
+     client request (do not change these hex values without stakeholder
+     sign-off) — the "USGS Earth", "River/Copper", and "High Contrast" themes
+     in the picker are colorblind-safe alternatives users can switch to. */
   --complete: #0072b2;
   --complete-bg: #e1eef7;
-  --progress: #f6c700;
-  --progress-bg: #fff8d7;
+  --complete-text: #00405f;
+  --progress: #287aa9;
+  --progress-bg: #e7f4fc;
+  --progress-text: #0b405d;
+  --upcoming: #71767a;
+  --upcoming-bg: #ffffff;
+  --upcoming-text: #3d3d3d;
   --skipped: #71767a;
   --skipped-bg: #f0f0f0;
   --returned: #b50909;
@@ -29,6 +43,54 @@
     linear-gradient(180deg, rgba(0, 132, 61, 0.06), transparent 260px),
     var(--subtle);
   padding: 24px;
+}
+
+.appShell[data-theme='usgsEarth'] {
+  --complete: #3f6f35;
+  --complete-bg: #e8f3e5;
+  --complete-text: #25491f;
+  --progress: #8f5e00;
+  --progress-bg: #fff4d6;
+  --progress-text: #4f3400;
+  --upcoming: #686f73;
+  --upcoming-bg: #ffffff;
+  --upcoming-text: #3d3d3d;
+}
+
+.appShell[data-theme='currentSlate'] {
+  --complete: #0072b2;
+  --complete-bg: #e1eef7;
+  --complete-text: #00405f;
+  --progress: #4f6678;
+  --progress-bg: #edf3f7;
+  --progress-text: #263f52;
+  --upcoming: #71767a;
+  --upcoming-bg: #ffffff;
+  --upcoming-text: #3d3d3d;
+}
+
+.appShell[data-theme='riverCopper'] {
+  --complete: #005ea8;
+  --complete-bg: #e5f1fb;
+  --complete-text: #003a66;
+  --progress: #c15100;
+  --progress-bg: #fff1e7;
+  --progress-text: #663000;
+  --upcoming: #686f73;
+  --upcoming-bg: #ffffff;
+  --upcoming-text: #3d3d3d;
+}
+
+.appShell[data-theme='highContrast'] {
+  --complete: #005ea8;
+  --complete-bg: #eaf4ff;
+  --complete-text: #003a66;
+  --progress: #6b3fa0;
+  --progress-bg: #f2ecfa;
+  --progress-text: #3d2364;
+  --upcoming: #4b4f54;
+  --upcoming-bg: #ffffff;
+  --upcoming-text: #242424;
 }
 
 .commandBar,
@@ -164,6 +226,75 @@
   gap: 8px;
 }
 
+.sectionHeaderActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.themeSwitcher {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.themeSwitcherLabel {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.themeSelect {
+  min-height: 32px;
+  color: var(--ink);
+  background: var(--canvas);
+  border: 1px solid #8a8886;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.themeSelect:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Live preview of the currently selected theme's three status colors. Reads
+   the SAME variables the stage list itself uses (--complete/--progress/
+   --upcoming), which App.tsx keeps in sync via data-theme on .appShell — so
+   this always reflects what's actually selected, not a fixed per-option value. */
+.themeSwatches {
+  display: inline-flex;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.themeSwatch {
+  width: 8px;
+  height: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  border-radius: 2px;
+}
+
+.themeSwatch--completed {
+  background: var(--complete);
+}
+
+.themeSwatch--progress {
+  background: var(--progress);
+}
+
+.themeSwatch--upcoming {
+  background: var(--upcoming);
+}
+
 .routeMeta span,
 .stageTags span {
   display: inline-flex;
@@ -261,7 +392,7 @@
 }
 
 .step[data-status='inProgress']:hover .stepContent {
-  background-color: #e7f4fc;
+  background-color: var(--progress-bg);
 }
 
 .step[aria-current='step'] .stepContent {
@@ -497,18 +628,16 @@
 
 .step[data-status='completed'],
 .legendItem[data-status='completed'] {
-  /* Completed = blue #0072B2 */
   --status-color: var(--complete);
   --status-bg: var(--complete-bg);
-  --status-text: #00405f;
+  --status-text: var(--complete-text);
 }
 
 .step[data-status='inProgress'],
 .legendItem[data-status='inProgress'] {
-  /* Current active = light blue #56B4E9 */
-  --status-color: #56b4e9;
-  --status-bg: #e7f4fc;
-  --status-text: #0b4c6b;
+  --status-color: var(--progress);
+  --status-bg: var(--progress-bg);
+  --status-text: var(--progress-text);
 }
 
 .step[data-status='skipped'],
@@ -520,10 +649,9 @@
 
 .step[data-status='upcoming'],
 .legendItem[data-status='upcoming'] {
-  /* Future = gray #999999 */
-  --status-color: #999999;
-  --status-bg: #ffffff;
-  --status-text: #5c5c5c;
+  --status-color: var(--upcoming);
+  --status-bg: var(--upcoming-bg);
+  --status-text: var(--upcoming-text);
 }
 
 .emptyState {
@@ -625,6 +753,16 @@
 
   .sectionHeader {
     flex-direction: column;
+  }
+
+  .sectionHeaderActions,
+  .themeSwitcher {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .themeSelect {
+    flex: 1 1 auto;
   }
 
   .routeMeta {

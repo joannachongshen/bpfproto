@@ -5,6 +5,16 @@ type StageStatus = 'completed' | 'inProgress' | 'upcoming'
 
 type LoadState = 'loading' | 'ready' | 'error'
 
+const workflowThemes = [
+  { id: 'current', label: 'Current' },
+  { id: 'currentSlate', label: 'Current + Slate' },
+  { id: 'usgsEarth', label: 'USGS Earth' },
+  { id: 'riverCopper', label: 'River/Copper' },
+  { id: 'highContrast', label: 'High Contrast' },
+] as const
+
+type WorkflowThemeId = (typeof workflowThemes)[number]['id']
+
 type WorkflowStage = {
   id: string
   stage: string
@@ -521,7 +531,17 @@ async function fetchTaskHistory(): Promise<{
       const ownerEntityType = raw[
         '_ownerid_value@Microsoft.Dynamics.CRM.lookuplogicalname'
       ] as string | undefined
-      const dueDate = formatDate(raw[TASK_DUE_DATE_FIELD] as string | undefined)
+      // Requested due date is an OPTIONAL field on the task — many tasks
+      // legitimately have none set. That's expected, not an error, so this is
+      // plain informational tracing (not a warning) to make it easy to see
+      // exactly what was read and why a due date is or isn't showing.
+      const rawDueDateValue = raw[TASK_DUE_DATE_FIELD] as string | undefined
+      const dueDate = formatDate(rawDueDateValue)
+      console.log(`  due date tracking for task ${taskId}`, {
+        field: TASK_DUE_DATE_FIELD,
+        rawValue: rawDueDateValue ?? '(not set)',
+        formattedValue: dueDate ?? '(not set)',
+      })
 
       const key = fromStageId.toLowerCase()
 
@@ -1024,6 +1044,13 @@ function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): 
   placed.splice(insertAt, 0, stage)
 }
 
+// Name of the universal first stage in every workflow group. Being sent back
+// to it is treated as a full reset of the record's displayed history (see
+// buildOrderedDisplay) — matched by name deliberately: this is a specific,
+// confirmed business rule about ONE named stage, not a general classification
+// of which stages are optional (that stays purely group-membership-based).
+const RESET_STAGE_NAME = 'prepare record'
+
 // Builds the ordered list of stages to DISPLAY for a record. Places the stages
 // belonging to the record's Workflow Group (from the M:N relationship) in their
 // sequence order, matched by stage ID (each stage at most once, so a stage the
@@ -1038,6 +1065,15 @@ function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): 
 // simply never gets placed — it does not display as a future stage. When no
 // group is assigned (groupStageIds null), nothing is pre-placed and only the
 // visited/current stages show — the visualizer never guesses a path.
+//
+// RESET EXCEPTION: if the record is currently sitting back at "Prepare Record"
+// (sent back to the very start), this is treated as a reset — optional stages
+// from before the reset (comment-reconciliation or otherwise) are NOT grafted
+// back in, even though they're still in the task history. Only the group's own
+// stages display; the record looks like it's starting fresh from Prepare
+// Record. (Once the record advances past Prepare Record again, any NEWLY
+// landed-on optional stage still grafts in normally — this only suppresses
+// stale history while sitting at the reset point itself.)
 function buildOrderedDisplay(
   stages: WorkflowStage[],
   groupStageIds: string[] | null,
@@ -1081,6 +1117,18 @@ function buildOrderedDisplay(
     'after step 1 (group stages placed)',
     placed.map((s) => s.stageName),
   )
+
+  const isBackAtResetStage =
+    currentStage?.stageName.trim().toLowerCase() === RESET_STAGE_NAME
+
+  if (isBackAtResetStage) {
+    console.log(
+      `record is back at "${currentStage?.stageName}" — treating as a reset, skipping optional-stage graft`,
+    )
+    console.log('output: final display order', placed.map((s) => s.stageName))
+    console.groupEnd()
+    return placed
+  }
 
   // 2. Graft in optional stages the record actually landed on (visited, or is
   //    the current stage — matched by id, not name). Only the specific stage(s)
@@ -1306,6 +1354,7 @@ function App() {
   const [groupNumber, setGroupNumber] = useState<number | null>(null)
   const [isLegacy, setIsLegacy] = useState(false)
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(() => new Set())
+  const [workflowTheme, setWorkflowTheme] = useState<WorkflowThemeId>('current')
   const [formContext] = useState<FormContext | undefined>(() => getFormContext())
 
   const toggleStage = useCallback((id: string) => {
@@ -1510,7 +1559,7 @@ function App() {
   const currentStage = stages.find((stage) => stage.id.toLowerCase() === currentStageId)
 
   return (
-    <main className="appShell">
+    <main className="appShell" data-theme={workflowTheme}>
       <section className="commandBar" aria-labelledby="workflow-title" hidden>
         <div className="workflowIntro">
           <p className="eyebrow">USGS model-driven app resource v2</p>
@@ -1536,9 +1585,35 @@ function App() {
                 : 'No form context — open this resource from a record form.'}
             </p>
           </div>
-          <div className="routeMeta" aria-label="Route details" hidden>
-            <span>Current: {currentStage?.stage ?? 'Loading'}</span>
-            <span>{groupNumber ? `Group ${groupNumber}` : 'Group —'}</span>
+          <div className="sectionHeaderActions">
+            <div className="routeMeta" aria-label="Route details" hidden>
+              <span>Current: {currentStage?.stage ?? 'Loading'}</span>
+              <span>{groupNumber ? `Group ${groupNumber}` : 'Group —'}</span>
+            </div>
+            <div className="themeSwitcher">
+              <label htmlFor="workflowThemeSelect" className="themeSwitcherLabel">
+                Color theme
+              </label>
+              <select
+                id="workflowThemeSelect"
+                className="themeSelect"
+                value={workflowTheme}
+                onChange={(event) =>
+                  setWorkflowTheme(event.target.value as WorkflowThemeId)
+                }
+              >
+                {workflowThemes.map((theme) => (
+                  <option key={theme.id} value={theme.id}>
+                    {theme.label}
+                  </option>
+                ))}
+              </select>
+              <span className="themeSwatches" aria-hidden="true">
+                <span className="themeSwatch themeSwatch--completed"></span>
+                <span className="themeSwatch themeSwatch--progress"></span>
+                <span className="themeSwatch themeSwatch--upcoming"></span>
+              </span>
+            </div>
           </div>
         </div>
 
