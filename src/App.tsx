@@ -34,6 +34,21 @@ type TaskDetail = {
   dueDate?: string
 }
 
+type WorkflowTaskSnapshot = TaskDetail & {
+  fromStageId: string
+  toStageId?: string
+  statuscode?: number
+  createdOn?: string
+  completedDate?: string
+}
+
+type TaskHistory = {
+  completionByStage: Map<string, string>
+  taskDetailByStage: Map<string, TaskDetail>
+  visitedStages: Set<string>
+  tasks: WorkflowTaskSnapshot[]
+}
+
 type DataverseWorkflowStageRow = {
   usgs_workflowstageid?: string
   usgs_stage: string
@@ -50,6 +65,7 @@ type DataverseWorkflowStageRow = {
 
 type DataverseWorkflowTaskRow = {
   usgs_workflowtaskid?: string
+  createdon?: string | null
   usgs_completeddate?: string | null
   usgs_comment?: string | null
   statuscode?: number
@@ -120,14 +136,27 @@ type XrmUtility = {
 // Form context exposed by the host page when this resource is embedded directly
 // on a form (Xrm.Page is deprecated but remains the only way for an independently
 // loaded web resource to read the form's current record).
+type FormSaveHandler = () => void
 type XrmFormEntity = {
   getId?: () => string
   getEntityName?: () => string
+  // Save-event registration. addOnPostSave fires AFTER the save completes (so a
+  // newly created record's id is available); addOnSave fires before completion.
+  // Used to reload the visualizer the moment the record is saved.
+  addOnSave?: (handler: FormSaveHandler) => void
+  removeOnSave?: (handler: FormSaveHandler) => void
+  addOnPostSave?: (handler: FormSaveHandler) => void
+  removeOnPostSave?: (handler: FormSaveHandler) => void
 }
 
 type XrmPage = {
   data?: {
     entity?: XrmFormEntity
+  }
+  ui?: {
+    // Xrm form type: 0=Undefined, 1=Create, 2=Update, ... Create (1) means a
+    // brand-new, not-yet-saved record.
+    getFormType?: () => number
   }
 }
 
@@ -166,6 +195,12 @@ const TASK_DUE_DATE_FIELD = 'usgs_duedate'
 // How often (ms) to silently re-fetch so task updates appear without a manual
 // reload. Also exposed as window.refreshWorkflowVisualizer() for the host form.
 const REFRESH_INTERVAL_MS = 10000
+
+// After a new record is saved (its id appears) or the form switches records,
+// the 1-second watcher retries loading until stages resolve. This caps those
+// fast retries so a record that legitimately has no workflow doesn't reload
+// every second indefinitely; the REFRESH_INTERVAL_MS refresh continues after.
+const NEW_RECORD_RELOAD_MAX_ATTEMPTS = 15
 
 // ---------------------------------------------------------------------------
 // Workflow group → stages (dynamic, from Dataverse — NOT hard-coded).
@@ -289,9 +324,15 @@ function getFormContext(): FormContext | undefined {
 }
 
 // Reads the record context from the host form when this resource is embedded on
-// a form (no `data` query parameter). The form context lives on the parent
-// window's Xrm.Page; the iframe's own Xrm has WebApi but no form. Falls back to
-// self in case the host injects Xrm.Page directly.
+// a form (no `data` query parameter). Tries each reachable Xrm (parent window
+// first, then self).
+//
+// For each, the record id is read from the SUPPORTED getPageContext() API
+// first, falling back to the deprecated Xrm.Page.data.entity. This matters for
+// the create -> save transition: when a brand-new record is saved without the
+// form reloading, getPageContext().input.entityId reflects the newly assigned
+// id, whereas Xrm.Page.data.entity.getId() often still reads empty until a full
+// page reload — which was why the visualizer needed a manual refresh to appear.
 function getHostFormContext(): FormContext | undefined {
   const candidates: (XrmContext | undefined)[] = []
 
@@ -303,14 +344,32 @@ function getHostFormContext(): FormContext | undefined {
   candidates.push(window.Xrm)
 
   for (const xrm of candidates) {
-    const entity = xrm?.Page?.data?.entity
+    let entityName = ''
+    let recordId = ''
 
-    if (!entity) {
-      continue
+    // Preferred: the supported current-page API.
+    try {
+      const input = xrm?.Utility?.getPageContext?.()?.input
+      if (input?.entityName) {
+        entityName = input.entityName
+      }
+      if (input?.entityId) {
+        recordId = input.entityId.replace(/[{}]/g, '')
+      }
+    } catch {
+      // getPageContext can throw when no page is active; fall through.
     }
 
-    const entityName = entity.getEntityName?.() ?? ''
-    const recordId = (entity.getId?.() ?? '').replace(/[{}]/g, '')
+    // Fallback: the deprecated Xrm.Page form entity for whatever is still blank.
+    const entity = xrm?.Page?.data?.entity
+    if (entity) {
+      if (!entityName) {
+        entityName = entity.getEntityName?.() ?? ''
+      }
+      if (!recordId) {
+        recordId = (entity.getId?.() ?? '').replace(/[{}]/g, '')
+      }
+    }
 
     if (entityName || recordId) {
       return { entityName, recordId }
@@ -318,6 +377,98 @@ function getHostFormContext(): FormContext | undefined {
   }
 
   return undefined
+}
+
+// Returns the host form's entity object (from parent window Xrm.Page, or self),
+// used to register save-event handlers. Separate from getHostFormContext, which
+// only reads the current id/name.
+function getHostFormEntity(): XrmFormEntity | undefined {
+  const candidates: (XrmContext | undefined)[] = []
+  try {
+    candidates.push(window.parent?.Xrm)
+  } catch {
+    // Cross-origin parent access can throw; ignore and try self.
+  }
+  candidates.push(window.Xrm)
+
+  for (const xrm of candidates) {
+    const entity = xrm?.Page?.data?.entity
+    if (entity) {
+      return entity
+    }
+  }
+  return undefined
+}
+
+// Xrm form type of the host form (1 = Create / brand-new unsaved record,
+// 2 = Update, etc.). null when it can't be read. Used to decide whether a save
+// is the first save of a new record.
+function getHostFormType(): number | null {
+  const candidates: (XrmContext | undefined)[] = []
+  try {
+    candidates.push(window.parent?.Xrm)
+  } catch {
+    // Cross-origin parent access can throw; ignore and try self.
+  }
+  candidates.push(window.Xrm)
+
+  for (const xrm of candidates) {
+    const getFormType = xrm?.Page?.ui?.getFormType
+    if (typeof getFormType === 'function') {
+      try {
+        return getFormType()
+      } catch {
+        // ignore and try the next candidate
+      }
+    }
+  }
+  return null
+}
+
+// Logs the raw id/name each context source reports, so the create->save
+// behavior can be traced in the browser console. Called at mount and on save.
+function logFormContextSources(label: string): void {
+  const read = (xrm: XrmContext | undefined, which: string) => {
+    if (!xrm) return
+    let pageCtx: unknown
+    try {
+      pageCtx = xrm.Utility?.getPageContext?.()?.input
+    } catch (error) {
+      pageCtx = `getPageContext threw: ${String(error)}`
+    }
+    let pageEntity: unknown
+    try {
+      const entity = xrm.Page?.data?.entity
+      pageEntity = entity
+        ? { id: entity.getId?.() ?? null, name: entity.getEntityName?.() ?? null }
+        : null
+    } catch (error) {
+      pageEntity = `Xrm.Page read threw: ${String(error)}`
+    }
+    let formType: unknown
+    try {
+      formType = xrm.Page?.ui?.getFormType?.() ?? null
+    } catch {
+      formType = null
+    }
+    console.log(`[WorkflowVisualizer] context source (${which})`, {
+      getPageContextInput: pageCtx,
+      xrmPageEntity: pageEntity,
+      formType,
+    })
+  }
+
+  console.groupCollapsed(`[WorkflowVisualizer] form context sources — ${label}`)
+  let parentXrm: XrmContext | undefined
+  try {
+    parentXrm = window.parent?.Xrm
+  } catch {
+    parentXrm = undefined
+  }
+  read(parentXrm, 'window.parent.Xrm')
+  read(window.Xrm, 'window.Xrm')
+  console.log('resolved getFormContext()', getFormContext())
+  console.groupEnd()
 }
 
 // Returns the host (parent app) Xrm that owns the side panes. Falls back to the
@@ -459,20 +610,165 @@ function formatDate(value: string | null | undefined): string | undefined {
   return year && month && day ? `${month}/${day}/${year}` : undefined
 }
 
+function buildTaskHistoryFromTasks(
+  tasks: WorkflowTaskSnapshot[],
+  resetStageId?: string,
+): TaskHistory {
+  const completionByStage = new Map<string, string>()
+  const taskDetailByStage = new Map<string, TaskDetail>()
+  const visitedStages = new Set<string>()
+  const normalizedResetStageId = resetStageId?.toLowerCase()
+
+  const resetCompletedDate = normalizedResetStageId
+    ? tasks.reduce<string | undefined>((latest, task) => {
+        if (
+          task.statuscode !== 2 ||
+          task.toStageId?.toLowerCase() !== normalizedResetStageId ||
+          !task.completedDate
+        ) {
+          return latest
+        }
+        return !latest || task.completedDate > latest ? task.completedDate : latest
+      }, undefined)
+    : undefined
+
+  if (resetCompletedDate) {
+    console.log(
+      '[WorkflowVisualizer] reset history at latest Prepare Record return',
+      { resetStageId: normalizedResetStageId, resetCompletedDate },
+    )
+  }
+
+  const taskIsInCurrentCycle = (task: WorkflowTaskSnapshot) => {
+    if (!resetCompletedDate) {
+      return true
+    }
+    if (task.statuscode === 2) {
+      return !!task.completedDate && task.completedDate > resetCompletedDate
+    }
+    return !task.createdOn || task.createdOn > resetCompletedDate
+  }
+
+  for (const task of tasks.filter(taskIsInCurrentCycle)) {
+    const key = task.fromStageId.toLowerCase()
+
+    if (task.statuscode === 2) {
+      if (!task.toStageId || !task.completedDate) {
+        console.log(
+          '[WorkflowVisualizer] visitedStages: skipping task — missing toStageId or completedDate',
+          {
+            taskId: task.taskId,
+            fromStageId: key,
+            toStageId: task.toStageId,
+            completedDate: task.completedDate,
+            statuscode: task.statuscode,
+          },
+        )
+        continue
+      }
+
+      visitedStages.add(key)
+      console.log('[WorkflowVisualizer] visitedStages.add (from stage)', key, 'set now:', [
+        ...visitedStages,
+      ])
+      visitedStages.add(task.toStageId.toLowerCase())
+      console.log(
+        '[WorkflowVisualizer] visitedStages.add (to stage)',
+        task.toStageId.toLowerCase(),
+        'set now:',
+        [...visitedStages],
+      )
+
+      const existing = completionByStage.get(key)
+      if (!existing || task.completedDate > existing) {
+        completionByStage.set(key, task.completedDate)
+        taskDetailByStage.set(key, {
+          taskId: task.taskId,
+          comment: task.comment,
+          ownerName: task.ownerName,
+          ownerId: task.ownerId,
+          ownerEntityType: task.ownerEntityType,
+        })
+        console.log('  recorded completion for from-stage', key, {
+          completedDate: task.completedDate,
+          ownerName: task.ownerName,
+        })
+      } else {
+        console.log('  kept existing (newer) completion for from-stage', key, {
+          existing,
+          thisDate: task.completedDate,
+        })
+      }
+    } else {
+      // Active task: show this cycle's assignee, due date, and comment on its
+      // own stage. It can supersede an earlier completion when a record is sent
+      // back to a previously completed stage.
+      taskDetailByStage.set(key, {
+        taskId: task.taskId,
+        comment: task.comment,
+        ownerName: task.ownerName,
+        ownerId: task.ownerId,
+        ownerEntityType: task.ownerEntityType,
+        dueDate: task.dueDate,
+      })
+      console.log('  active task — recorded assignee + due date for stage', key, {
+        ownerName: task.ownerName,
+        dueDate: task.dueDate,
+        statuscode: task.statuscode,
+      })
+    }
+  }
+
+  // Openability fallback for pass-through stages. A stage the record ENTERED
+  // (a completed task's TO stage) shows as completed and landed-on, but if no
+  // task is keyed FROM it above (it had no actionable task of its own — e.g.
+  // "Peer Review and Reconciliation"), it would have no taskId and couldn't be
+  // opened. Link such a stage to the most-recently-completed task that arrived
+  // at it so it can be opened. taskId ONLY — no assignee/comment/due is copied
+  // from that (previous-stage) task, so a pass-through stage shows no wrong
+  // owner. Stages that already have their own detail (a FROM task, or the
+  // active task) are left untouched, and the "most recent" pick keeps this
+  // correct after a send-back to Prepare Record (tasks are already filtered to
+  // the current cycle).
+  const latestArrivalByStage = new Map<string, { taskId: string; completedDate: string }>()
+  for (const task of tasks.filter(taskIsInCurrentCycle)) {
+    if (task.statuscode !== 2 || !task.toStageId || !task.completedDate) {
+      continue
+    }
+    const toKey = task.toStageId.toLowerCase()
+    const existing = latestArrivalByStage.get(toKey)
+    if (!existing || task.completedDate > existing.completedDate) {
+      latestArrivalByStage.set(toKey, {
+        taskId: task.taskId,
+        completedDate: task.completedDate,
+      })
+    }
+  }
+  for (const [stageKey, arrival] of latestArrivalByStage) {
+    if (!taskDetailByStage.has(stageKey)) {
+      taskDetailByStage.set(stageKey, { taskId: arrival.taskId })
+      console.log(
+        '  openability fallback — pass-through stage linked to arrival task',
+        stageKey,
+        arrival.taskId,
+      )
+    }
+  }
+
+  return { completionByStage, taskDetailByStage, visitedStages, tasks }
+}
+
 // Reads all tasks for this record to reconstruct the path it actually took.
 // Finalized tasks (statuscode 2) populate completionByStage, visitedStages, and
 // taskDetailByStage. Active tasks (any other statuscode) populate taskDetailByStage
 // for the in-progress stage so the assignee AND that task's own due date are
 // visible there. The due date is never mapped to a different stage — it always
 // describes the task's own (current) stage.
-async function fetchTaskHistory(): Promise<{
-  completionByStage: Map<string, string>
-  taskDetailByStage: Map<string, TaskDetail>
-  visitedStages: Set<string>
-}> {
+async function fetchTaskHistory(): Promise<TaskHistory> {
   const completionByStage = new Map<string, string>()
   const taskDetailByStage = new Map<string, TaskDetail>()
   const visitedStages = new Set<string>()
+  const tasks: WorkflowTaskSnapshot[] = []
   const xrm = getXrmContext()
   const formContext = getFormContext()
 
@@ -486,12 +782,12 @@ async function fetchTaskHistory(): Promise<{
       { hasXrm: !!xrm, recordId: formContext?.recordId },
     )
     console.groupEnd()
-    return { completionByStage, taskDetailByStage, visitedStages }
+    return { completionByStage, taskDetailByStage, visitedStages, tasks }
   }
 
   try {
     const query =
-      `?$select=usgs_workflowtaskid,usgs_completeddate,usgs_comment,statuscode,_ownerid_value,${TASK_DUE_DATE_FIELD},` +
+      `?$select=usgs_workflowtaskid,createdon,usgs_completeddate,usgs_comment,statuscode,_ownerid_value,${TASK_DUE_DATE_FIELD},` +
       '_usgs_workflowstagefrom_value,_usgs_workflowstageto_value' +
       `&$filter=_usgs_informationproductid_value eq ${formContext.recordId}`
 
@@ -514,6 +810,7 @@ async function fetchTaskHistory(): Promise<{
         statuscode: task.statuscode,
         from: task._usgs_workflowstagefrom_value,
         to: task._usgs_workflowstageto_value,
+        createdOn: task.createdon,
         completedDate: task.usgs_completeddate,
       })
 
@@ -545,72 +842,34 @@ async function fetchTaskHistory(): Promise<{
 
       const key = fromStageId.toLowerCase()
 
-      if (task.statuscode === 2) {
-        // Finalized task: records the completion of its From stage.
-        const toStageId = asGuid(task._usgs_workflowstageto_value)
-        const completedDate = task.usgs_completeddate
-
-        if (!toStageId || !completedDate) {
-          console.log(
-            '[WorkflowVisualizer] visitedStages: skipping task — missing toStageId or completedDate',
-            { taskId, fromStageId: key, toStageId, completedDate, statuscode: task.statuscode },
-          )
-          continue
-        }
-
-        visitedStages.add(key)
-        console.log('[WorkflowVisualizer] visitedStages.add (from stage)', key, 'set now:', [...visitedStages])
-        visitedStages.add(toStageId.toLowerCase())
-        console.log('[WorkflowVisualizer] visitedStages.add (to stage)', toStageId.toLowerCase(), 'set now:', [...visitedStages])
-
-        const existing = completionByStage.get(key)
-        if (!existing || completedDate > existing) {
-          completionByStage.set(key, completedDate)
-          taskDetailByStage.set(key, {
-            taskId,
-            comment: task.usgs_comment ?? undefined,
-            ownerName,
-            ownerId,
-            ownerEntityType,
-            // No dueDate here: this stage's task is done, so its due date is
-            // no longer relevant — due dates only apply to the active task.
-          })
-          console.log('  recorded completion for from-stage', key, { completedDate, ownerName })
-        } else {
-          console.log('  kept existing (newer) completion for from-stage', key, { existing, thisDate: completedDate })
-        }
-      } else {
-        // Active task: show assignee and this task's own due date on the
-        // in-progress (from) stage. Finalized task for the same From stage
-        // (if any) takes precedence.
-        if (!completionByStage.has(key)) {
-          taskDetailByStage.set(key, {
-            taskId,
-            comment: task.usgs_comment ?? undefined,
-            ownerName,
-            ownerId,
-            ownerEntityType,
-            dueDate,
-          })
-          console.log('  active task — recorded assignee + due date for stage', key, { ownerName, dueDate, statuscode: task.statuscode })
-        } else {
-          console.log('  active task — skipped, finalized completion already exists for stage', key)
-        }
-      }
+      tasks.push({
+        taskId,
+        fromStageId: key,
+        toStageId: asGuid(task._usgs_workflowstageto_value)?.toLowerCase(),
+        statuscode: task.statuscode,
+        createdOn: task.createdon ?? undefined,
+        completedDate: task.usgs_completeddate ?? undefined,
+        comment: task.usgs_comment ?? undefined,
+        ownerName,
+        ownerId,
+        ownerEntityType,
+        dueDate,
+      })
     }
   } catch (error) {
     // Leave the maps empty — stages still render, just unfiltered and undated.
     console.warn('[WorkflowVisualizer] fetchTaskHistory failed', error)
   }
 
+  const result = buildTaskHistoryFromTasks(tasks)
   // visitedStages is fully populated here (all finalized tasks processed). Log
   // both the Set and an array snapshot — some consoles render Sets unhelpfully.
-  console.log('result: visitedStages (array)', [...visitedStages])
-  console.log('result: completionByStage', Object.fromEntries(completionByStage))
-  console.log('result: taskDetailByStage', Object.fromEntries(taskDetailByStage))
+  console.log('result: visitedStages (array)', [...result.visitedStages])
+  console.log('result: completionByStage', Object.fromEntries(result.completionByStage))
+  console.log('result: taskDetailByStage', Object.fromEntries(result.taskDetailByStage))
   console.groupEnd()
 
-  return { completionByStage, taskDetailByStage, visitedStages }
+  return result
 }
 
 function asGuid(value: unknown): string | undefined {
@@ -1046,10 +1305,14 @@ function insertByGlobalSequence(placed: WorkflowStage[], stage: WorkflowStage): 
 
 // Name of the universal first stage in every workflow group. Being sent back
 // to it is treated as a full reset of the record's displayed history (see
-// buildOrderedDisplay) — matched by name deliberately: this is a specific,
-// confirmed business rule about ONE named stage, not a general classification
-// of which stages are optional (that stays purely group-membership-based).
+// buildTaskHistoryFromTasks and buildOrderedDisplay) — matched by name
+// deliberately: this is a specific, confirmed business rule about ONE named
+// stage, not a general classification of which stages are optional.
 const RESET_STAGE_NAME = 'prepare record'
+
+function isResetStage(stage: WorkflowStage): boolean {
+  return stage.stageName.trim().toLowerCase() === RESET_STAGE_NAME
+}
 
 // Builds the ordered list of stages to DISPLAY for a record. Places the stages
 // belonging to the record's Workflow Group (from the M:N relationship) in their
@@ -1066,24 +1329,31 @@ const RESET_STAGE_NAME = 'prepare record'
 // group is assigned (groupStageIds null), nothing is pre-placed and only the
 // visited/current stages show — the visualizer never guesses a path.
 //
-// RESET EXCEPTION: if the record is currently sitting back at "Prepare Record"
-// (sent back to the very start), this is treated as a reset — optional stages
-// from before the reset (comment-reconciliation or otherwise) are NOT grafted
-// back in, even though they're still in the task history. Only the group's own
-// stages display; the record looks like it's starting fresh from Prepare
-// Record. (Once the record advances past Prepare Record again, any NEWLY
-// landed-on optional stage still grafts in normally — this only suppresses
-// stale history while sitting at the reset point itself.)
+// RESET EXCEPTION: if the record is currently sitting back at "Prepare Record",
+// optional stages are not grafted in while it is at the reset point. The broader
+// stale-history cleanup happens earlier in buildTaskHistoryFromTasks, where
+// tasks before the latest completed transition back to Prepare Record are
+// removed from the displayed cycle.
+//
+// LEGACY EXCEPTION: migrated legacy records (isLegacy) show ONLY their workflow
+// group's standard stages — the off-path graft is skipped entirely. Legacy
+// records carry imported task history from the OLD system whose stages are not
+// part of the new workflow at all; grafting those in would surface old-system
+// stages that don't belong. Per the AC, legacy records display the standard
+// path for their workflow group and the visualizer does not try to reconstruct
+// historical stages from the imported task data.
 function buildOrderedDisplay(
   stages: WorkflowStage[],
   groupStageIds: string[] | null,
   currentStage: WorkflowStage | undefined,
   visited: (stage: WorkflowStage) => boolean,
+  isLegacy: boolean,
 ): WorkflowStage[] {
   console.groupCollapsed('[WorkflowVisualizer] buildOrderedDisplay')
   console.log('input: total stages in catalog', stages.length)
   console.log('input: groupStageIds', groupStageIds)
   console.log('input: currentStage', currentStage?.stageName, currentStage?.id)
+  console.log('input: isLegacy', isLegacy)
 
   const byId = new Map<string, WorkflowStage>()
   for (const stage of stages) {
@@ -1118,8 +1388,30 @@ function buildOrderedDisplay(
     placed.map((s) => s.stageName),
   )
 
-  const isBackAtResetStage =
-    currentStage?.stageName.trim().toLowerCase() === RESET_STAGE_NAME
+  const isBackAtResetStage = currentStage ? isResetStage(currentStage) : false
+
+  if (isLegacy) {
+    // Legacy: show the group's stages only — do NOT graft visited old-system
+    // history (those imported stages don't belong to the new workflow). BUT
+    // still surface the CURRENT stage if it is off-path (e.g. the record was
+    // sent to a comment-reconciliation stage), so the record's in-progress
+    // position is visible and prior stages read as completed. buildStageViewModels
+    // marks status for legacy records by sequence number, not by visited history.
+    if (currentStage && !placedIds.has(currentStage.id)) {
+      insertByGlobalSequence(placed, currentStage)
+      placedIds.add(currentStage.id)
+      console.log(
+        'legacy: grafted current off-path stage so it shows as in progress',
+        currentStage.stageName,
+      )
+    }
+    console.log(
+      'record is a migrated legacy record — group stages + current stage only, no visited-history graft',
+    )
+    console.log('output: final display order', placed.map((s) => s.stageName))
+    console.groupEnd()
+    return placed
+  }
 
   if (isBackAtResetStage) {
     console.log(
@@ -1198,20 +1490,37 @@ function buildStageViewModels(
 
   // Decide which stages to display, and in what order: the record's Workflow
   // Group stages (from the M:N relationship) plus any reconciliation stages it
-  // was actually routed through. Legacy records use the same group stages (per
-  // AC — show the standard path for the group; don't reconstruct missing
-  // history).
-  const display = buildOrderedDisplay(stages, groupStageIds, currentStage, visited)
+  // was actually routed through. Legacy records show ONLY the group stages (per
+  // AC — the standard path for the group; the visualizer does not reconstruct
+  // history or surface imported old-system stages).
+  const display = buildOrderedDisplay(stages, groupStageIds, currentStage, visited, isLegacy)
 
   // Status is positional within the display list — NOT global sequence. A
   // record sent back to an earlier stage simply shows that stage as in
   // progress again (no separate "returned" state — matches the AC's 3-color
   // scheme: completed / current / future only).
   const currentIndex = display.findIndex(isCurrent)
+  // For legacy records the imported task history is incomplete/unreliable, so
+  // "visited" can't drive completed/upcoming. Instead, progress is derived from
+  // the record's current stage by sequence number: everything before it is
+  // completed, it is in progress, everything after is upcoming — even when the
+  // record was sent back or to a comment-reconciliation stage.
+  const currentSequence = currentStage ? currentStage.sequenceNumber : null
 
   const result: StageViewModel[] = display.map((stage, index) => {
     let status: StageStatus
-    if (currentIndex === -1) {
+    if (isLegacy) {
+      if (currentSequence === null) {
+        // No resolvable current stage — can't infer progress; show the path.
+        status = 'upcoming'
+      } else if (isCurrent(stage)) {
+        status = 'inProgress'
+      } else if (stage.sequenceNumber < currentSequence) {
+        status = 'completed'
+      } else {
+        status = 'upcoming'
+      }
+    } else if (currentIndex === -1) {
       // No resolved current stage: anything visited is completed, rest upcoming.
       status = visited(stage) ? 'completed' : 'upcoming'
     } else if (index < currentIndex) {
@@ -1326,11 +1635,33 @@ function OpenInNewIcon() {
   )
 }
 
-function CommentBadge() {
+// Renders a task comment, truncating anything longer than this many characters
+// to an ellipsis with an inline "Show more"/"Show less" toggle so long comments
+// don't blow out the stage card.
+const COMMENT_TRUNCATE_LENGTH = 300
+
+function TaskComment({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const isLong = text.length > COMMENT_TRUNCATE_LENGTH
+  const shownText =
+    isLong && !expanded
+      ? `${text.slice(0, COMMENT_TRUNCATE_LENGTH).trimEnd()}…`
+      : text
+
   return (
-    <svg className="commentBadge" viewBox="0 0 16 16" focusable="false" aria-label="Has comment">
-      <path d="M2 1h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H9l-2 2.5L5 10H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1z" />
-    </svg>
+    <div className="taskComment">
+      <p className="taskCommentText">{shownText}</p>
+      {isLong && (
+        <button
+          type="button"
+          className="taskCommentToggle"
+          onClick={() => setExpanded((prev) => !prev)}
+          aria-expanded={expanded}
+        >
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -1356,6 +1687,17 @@ function App() {
   const [expandedStageIds, setExpandedStageIds] = useState<Set<string>>(() => new Set())
   const [workflowTheme, setWorkflowTheme] = useState<WorkflowThemeId>('current')
   const [formContext] = useState<FormContext | undefined>(() => getFormContext())
+
+  // Record id the visualizer has SUCCESSFULLY loaded stages for. Updated only on
+  // a successful load (not merely when the id appears), so a brand-new record
+  // whose workflow/group fields haven't committed the instant it's saved keeps
+  // being retried instead of sticking on the empty "no workflow" state.
+  // Initialized to the mount-time id so an already-saved record behaves exactly
+  // as before (no extra reload); a brand-new record mounts with no id (''), so
+  // it retries once its id appears on Save.
+  const settledRecordIdRef = useRef<string>(formContext?.recordId ?? '')
+  // Bounded fast-retry bookkeeping for the not-yet-settled current record.
+  const reloadAttemptsRef = useRef<{ id: string; count: number }>({ id: '', count: 0 })
 
   const toggleStage = useCallback((id: string) => {
     setExpandedStageIds((prev) => {
@@ -1384,6 +1726,9 @@ function App() {
   const loadStages = useCallback(async (options?: { silent?: boolean }) => {
     const silent = options?.silent ?? false
     console.groupCollapsed(`[WorkflowVisualizer] loadStages (silent=${silent})`)
+    // Record id this load is for, captured up front so we can mark it "settled"
+    // only if the load actually resolves stages (see the success path below).
+    const loadingRecordId = getFormContext()?.recordId ?? ''
 
     try {
       const [
@@ -1465,15 +1810,25 @@ function App() {
         nextGroupStages && nextGroupStages.length > 0
           ? nextGroupStages.map((stage) => stage.id.toLowerCase())
           : null
+      const groupStageIdSet = nextGroupStageIds ? new Set(nextGroupStageIds) : null
+      const resetStage =
+        mergedStages.find(
+          (stage) => isResetStage(stage) && groupStageIdSet?.has(stage.id.toLowerCase()),
+        ) ?? mergedStages.find(isResetStage)
+      const displayTaskHistory = buildTaskHistoryFromTasks(
+        taskHistory.tasks,
+        resetStage?.id,
+      )
 
       console.log('merged catalog stage count', mergedStages.length)
       console.log('derived groupStageIds', nextGroupStageIds)
+      console.log('resolved reset stage', resetStage?.stageName, resetStage?.id)
 
       setStages(mergedStages)
       setCurrentStageId(stageId ? stageId.toLowerCase() : null)
-      setCompletionByStage(taskHistory.completionByStage)
-      setTaskDetailByStage(taskHistory.taskDetailByStage)
-      setVisitedStages(taskHistory.visitedStages)
+      setCompletionByStage(displayTaskHistory.completionByStage)
+      setTaskDetailByStage(displayTaskHistory.taskDetailByStage)
+      setVisitedStages(displayTaskHistory.visitedStages)
       setGroupStageIds(nextGroupStageIds)
       setGroupNumber(nextGroupNumber ?? null)
       setIsLegacy(nextIsLegacy ?? false)
@@ -1483,7 +1838,17 @@ function App() {
           : 'No workflow group stages resolved.',
       )
       setLoadState('ready')
-      console.log('state applied — loadState set to ready')
+      // Consider the record "settled" only once we actually resolved something
+      // to show (a workflow group path, or at least some catalog stages). A
+      // just-saved record whose group/workflow fields haven't committed yet
+      // resolves nothing here, so it stays unsettled and the 1s watcher keeps
+      // retrying until the data appears.
+      if (loadingRecordId && (nextGroupStageIds !== null || mergedStages.length > 0)) {
+        settledRecordIdRef.current = loadingRecordId
+      }
+      console.log('state applied — loadState set to ready', {
+        settled: settledRecordIdRef.current,
+      })
       console.groupEnd()
     } catch (error) {
       console.warn('[WorkflowVisualizer] loadStages failed', error)
@@ -1528,19 +1893,170 @@ function App() {
     }
   }, [loadStages])
 
-  // The side pane has no "form close" event, so poll the app's main area every
-  // second. The pane stays only while a usgs_informationproduct *record form*
-  // is open; navigating to its view/list, another entity, or no record at all
-  // closes it. Reads the live main-window URL rather than the stale Xrm.Page.
+  // Polled once per second for two things:
+  //   1. Side-pane cleanup: the pane has no "form close" event, so if the app's
+  //      main area is no longer a usgs_informationproduct record form, close it.
+  //   2. New-record / record-switch detection: when a brand-new record is saved
+  //      its id appears on the form (or the form navigates to another record).
+  //      Reload immediately so the visualizer shows up right after Save instead
+  //      of only after the 30s periodic refresh or a manual page reload.
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       if (!isOnInformationProductRecord()) {
         closeWorkflowPane()
       }
+
+      const currentRecordId = getFormContext()?.recordId ?? ''
+      if (currentRecordId && currentRecordId !== settledRecordIdRef.current) {
+        // Not yet successfully loaded for this record — either a brand-new
+        // record whose id just appeared on Save, a form record-switch, or a
+        // just-saved record whose workflow/group fields haven't committed yet.
+        // Retry until loadStages settles it (settledRecordIdRef updates on a
+        // successful load), bounded so a record that legitimately has no
+        // workflow doesn't reload every second forever — the periodic refresh
+        // (REFRESH_INTERVAL_MS) remains the long-term fallback after that.
+        if (reloadAttemptsRef.current.id !== currentRecordId) {
+          reloadAttemptsRef.current = { id: currentRecordId, count: 0 }
+        }
+        if (reloadAttemptsRef.current.count < NEW_RECORD_RELOAD_MAX_ATTEMPTS) {
+          reloadAttemptsRef.current.count += 1
+          console.log('[WorkflowVisualizer] record not settled — reloading', {
+            recordId: currentRecordId,
+            attempt: reloadAttemptsRef.current.count,
+          })
+          void loadStages({ silent: true })
+        }
+      }
     }, 1000)
 
     return () => window.clearInterval(intervalId)
-  }, [])
+  }, [loadStages])
+
+  // Event-driven trigger: register a handler on the host form's save event so
+  // the visualizer appears the instant the user clicks Save — most importantly
+  // the FIRST save of a brand-new record, which assigns its id + workflow.
+  //
+  // For an existing record (Update form) we do in-place reloads (spaced, to let
+  // any changes commit) — cheap and non-disruptive.
+  //
+  // For a brand-new record (Create form) the in-place path is unreliable in the
+  // Unified Interface — the running app often can't read the newly assigned id
+  // until a full page reload (which is why a manual browser refresh works). So
+  // after a new record's first save we do a ONE-TIME full page reload, matching
+  // what the manual refresh does. Guards prevent a reload loop: it only runs
+  // when the form was in Create mode at save time, and a sessionStorage marker
+  // blocks another auto-reload within a short window.
+  useEffect(() => {
+    const AUTO_RELOAD_MARKER = 'wfvAutoReloadAt'
+    const AUTO_RELOAD_COOLDOWN_MS = 15000
+
+    const autoReloadMarkerAge = (): number | null => {
+      try {
+        const last = Number(window.sessionStorage.getItem(AUTO_RELOAD_MARKER) ?? 0)
+        if (!Number.isFinite(last) || last <= 0) {
+          return null
+        }
+        return Date.now() - last
+      } catch {
+        return null
+      }
+    }
+
+    const autoReloadRecentlyRan = (): boolean => {
+      const age = autoReloadMarkerAge()
+      return age !== null && age < AUTO_RELOAD_COOLDOWN_MS
+    }
+
+    // If this page load is the result of our own auto-reload after a new-record
+    // save, the marker was set moments ago (just before reload()). Log it so the
+    // full round trip — save -> auto-reload -> fresh load showing the visualizer
+    // — is visible in the console (the "reloading…" log just before reload() is
+    // lost when the page navigates).
+    const reloadAge = autoReloadMarkerAge()
+    if (reloadAge !== null && reloadAge < AUTO_RELOAD_COOLDOWN_MS) {
+      console.log(
+        '[WorkflowVisualizer] page was auto-reloaded after a new-record save',
+        { msSinceReloadTriggered: reloadAge, recordId: getFormContext()?.recordId ?? '(none)' },
+      )
+    }
+
+    const entity = getHostFormEntity()
+    logFormContextSources('mount / save-handler registration')
+    console.log('[WorkflowVisualizer] host form type at mount', getHostFormType())
+
+    if (!entity) {
+      console.log('[WorkflowVisualizer] no host form entity — save handler not registered')
+      return
+    }
+
+    const handleSaved = () => {
+      const formTypeAtSave = getHostFormType()
+      console.log('[WorkflowVisualizer] form SAVE event fired', {
+        formTypeAtSave,
+        isCreate: formTypeAtSave === 1,
+      })
+      logFormContextSources('save event')
+
+      // Always attempt in-place reloads (covers update-saves and environments
+      // where the id is readable in place).
+      for (const delayMs of [0, 500, 1500, 3000]) {
+        window.setTimeout(() => {
+          void loadStages({ silent: true })
+        }, delayMs)
+      }
+
+      // New-record first save: fall back to a one-time full reload so the
+      // visualizer shows without a manual refresh.
+      if (formTypeAtSave === 1) {
+        if (autoReloadRecentlyRan()) {
+          console.log(
+            '[WorkflowVisualizer] new-record save, but an auto-reload ran recently — skipping to avoid a loop',
+          )
+          return
+        }
+        try {
+          window.sessionStorage.setItem(AUTO_RELOAD_MARKER, String(Date.now()))
+        } catch {
+          // sessionStorage unavailable; proceed without the guard marker.
+        }
+        // Delay so the save commits and the app URL updates to the saved record
+        // before we reload (otherwise the reload could reopen a blank form).
+        window.setTimeout(() => {
+          const target = window.top ?? window
+          console.log('[WorkflowVisualizer] new record saved — reloading app to display the visualizer')
+          try {
+            target.location.reload()
+          } catch (error) {
+            console.warn('[WorkflowVisualizer] top reload failed; reloading iframe instead', error)
+            window.location.reload()
+          }
+        }, 1200)
+      }
+    }
+
+    const usePostSave = typeof entity.addOnPostSave === 'function'
+    if (usePostSave) {
+      entity.addOnPostSave!(handleSaved)
+      console.log('[WorkflowVisualizer] registered addOnPostSave handler')
+    } else if (typeof entity.addOnSave === 'function') {
+      entity.addOnSave(handleSaved)
+      console.log('[WorkflowVisualizer] registered addOnSave handler (addOnPostSave unavailable)')
+    } else {
+      console.log('[WorkflowVisualizer] form entity has no save-event API')
+    }
+
+    return () => {
+      try {
+        if (usePostSave) {
+          entity.removeOnPostSave?.(handleSaved)
+        } else {
+          entity.removeOnSave?.(handleSaved)
+        }
+      } catch {
+        // Handler removal best-effort; ignore if the form context is gone.
+      }
+    }
+  }, [loadStages])
 
   const stageViewModels = useMemo(
     () =>
@@ -1624,6 +2140,14 @@ function App() {
           </div>
         )}
 
+        {loadState === 'ready' && isLegacy && (
+          <p className="legacyNotice" role="status">
+            Because this Information Product was migrated from legacy IPDS,
+            some of these stages might not apply to the original record — they
+            appear here as the standard path for its workflow group.
+          </p>
+        )}
+
         {loadState === 'ready' && groupStageIds === null && (
           <p
             className="workflowNotice"
@@ -1644,13 +2168,17 @@ function App() {
           >
             {stageViewModels.map((stage) => {
               const isExpanded = expandedStageIds.has(stage.id)
-              // Only assignee, requested due date, and completed date are
-              // shown — stage descriptions are intentionally excluded.
-              const hasDetails =
-                !!stage.comment ||
-                !!stage.ownerName ||
-                !!stage.dueDate ||
-                !!stage.taskId
+              // Details (assignee, requested due date, comment) are collapsed by
+              // default and revealed by the expand chevron. The chevron only
+              // appears when there is actually something to show.
+              const hasExpandable =
+                !!stage.ownerName || !!stage.dueDate || !!stage.comment
+              // Clicking the stage opens its task record: the completed stage's
+              // task, or the current task for the in-progress stage. Upcoming
+              // stages have no task, so the title isn't clickable there.
+              const canOpenTask = !!stage.taskId
+              const openTask = () =>
+                navigateToRecord('usgs_workflowtask', stage.taskId!)
 
               return (
                 <li
@@ -1664,72 +2192,85 @@ function App() {
                     <StatusIcon status={stage.status} />
                   </div>
                   <div className="stepContent">
-                    <button
-                      type="button"
-                      className="stepHeader"
-                      onClick={() => toggleStage(stage.id)}
-                      aria-expanded={isExpanded}
-                    >
-                      <div className="stepHeaderMain">
-                        <div className="stageTitleRow">
-                          <span className="statusPill">
-                            {statusContent[stage.status].label}
-                          </span>
-                        </div>
-                        <h3>{stage.stageName}</h3>
-                        {stage.completedOn && (
-                          <p className="completedText">
-                            {stage.completedOn}
-                            {stage.comment && <CommentBadge />}
-                          </p>
-                        )}
-                      </div>
-                      {hasDetails && <ChevronIcon expanded={isExpanded} />}
-                    </button>
-
-                    {isExpanded && hasDetails && (
-                      <div className="stageDetails">
-                        <div className="detailMeta">
-                          <div className="detailMetaLeft">
-                            {stage.ownerName && (
-                              <span className="detailUserLine">
-                                <PersonIcon />
-                                {stage.ownerId && stage.ownerEntityType ? (
-                                  <button
-                                    className="ownerLink"
-                                    onClick={() =>
-                                      navigateToRecord(
-                                        stage.ownerEntityType!,
-                                        stage.ownerId!,
-                                      )
-                                    }
-                                  >
-                                    {stage.ownerName}
-                                  </button>
-                                ) : (
-                                  <span>{stage.ownerName}</span>
-                                )}
+                    <div className="stepHeader">
+                      {canOpenTask ? (
+                        <button
+                          type="button"
+                          className="stageOpenButton"
+                          onClick={openTask}
+                          title="Open the task record for this stage"
+                        >
+                          <div className="stepHeaderMain">
+                            <div className="stageTitleRow">
+                              <span className="statusPill">
+                                {statusContent[stage.status].label}
                               </span>
-                            )}
-                            {stage.dueDate && (
-                              <span className="detailDueLine">
-                                Due {stage.dueDate}
+                              <span className="openTaskHint" aria-hidden="true">
+                                <OpenInNewIcon />
                               </span>
-                            )}
-                            {stage.comment && (
-                              <p className="taskComment">{stage.comment}</p>
+                            </div>
+                            <h3>{stage.stageName}</h3>
+                            {stage.completedOn && (
+                              <p className="completedText">{stage.completedOn}</p>
                             )}
                           </div>
-                          {stage.taskId && (
-                            <button
-                              className="openTaskIconBtn"
-                              title="Open task record"
-                              onClick={() => navigateToRecord('usgs_workflowtask', stage.taskId!)}
-                            >
-                              <OpenInNewIcon />
-                            </button>
-                          )}
+                        </button>
+                      ) : (
+                        <div className="stageOpenButton stageOpenButton--static">
+                          <div className="stepHeaderMain">
+                            <div className="stageTitleRow">
+                              <span className="statusPill">
+                                {statusContent[stage.status].label}
+                              </span>
+                            </div>
+                            <h3>{stage.stageName}</h3>
+                            {stage.completedOn && (
+                              <p className="completedText">{stage.completedOn}</p>
+                            )}
+                          </div>
                         </div>
+                      )}
+                      {hasExpandable && (
+                        <button
+                          type="button"
+                          className="expandButton"
+                          onClick={() => toggleStage(stage.id)}
+                          aria-expanded={isExpanded}
+                          aria-label={
+                            isExpanded ? 'Hide task details' : 'Show task details'
+                          }
+                        >
+                          <ChevronIcon expanded={isExpanded} />
+                        </button>
+                      )}
+                    </div>
+
+                    {isExpanded && hasExpandable && (
+                      <div className="stageDetails">
+                        {stage.ownerName && (
+                          <span className="detailUserLine">
+                            <PersonIcon />
+                            {stage.ownerId && stage.ownerEntityType ? (
+                              <button
+                                className="ownerLink"
+                                onClick={() =>
+                                  navigateToRecord(
+                                    stage.ownerEntityType!,
+                                    stage.ownerId!,
+                                  )
+                                }
+                              >
+                                {stage.ownerName}
+                              </button>
+                            ) : (
+                              <span>{stage.ownerName}</span>
+                            )}
+                          </span>
+                        )}
+                        {stage.dueDate && (
+                          <span className="detailDueLine">Due {stage.dueDate}</span>
+                        )}
+                        {stage.comment && <TaskComment text={stage.comment} />}
                       </div>
                     )}
                   </div>
